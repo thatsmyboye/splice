@@ -14,8 +14,7 @@ export function WaveformScrubber({
   onTimestampSelect,
 }: WaveformScrubberProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const wsRef = useRef<any>(null);
+  const wsRef = useRef<any>(null); // wavesurfer.js dynamic import lacks stable TS types
   const [isReady, setIsReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
@@ -44,7 +43,6 @@ export function WaveformScrubber({
 
       wsRef.current = ws;
 
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const waveform = ws as any;
       waveform.load(previewUrl);
       waveform.on("ready", () => {
