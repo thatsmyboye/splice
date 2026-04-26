@@ -48,7 +48,6 @@ export async function POST(request: NextRequest) {
   }
 
   // Use provided metadata or fetch from Spotify
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let track = trackMetadata as any;
   if (!track) {
     try {
