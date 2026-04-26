@@ -1,0 +1,8 @@
+{
+    "experimentalServices": {
+        "web": {
+            "entrypoint": ".",
+            "framework": "nextjs"
+        }
+    }
+}
