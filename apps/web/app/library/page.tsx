@@ -57,7 +57,7 @@ export default async function LibraryPage() {
         ) : (
           <div className="space-y-3">
             {moments.map((moment) => {
-              const track = moment.tracks as {
+              const track = (moment.tracks as unknown) as {
                 spotify_id: string;
                 title: string;
                 artist: string;
