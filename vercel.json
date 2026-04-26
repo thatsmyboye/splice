@@ -1,4 +1,5 @@
 {
+    "installCommand": "pnpm install",
     "experimentalServices": {
         "web": {
             "entrypoint": "apps/web",
