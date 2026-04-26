@@ -1,0 +1,9 @@
+{
+  "name": "@splice/config",
+  "version": "0.1.0",
+  "private": true,
+  "exports": {
+    "./eslint": "./eslint-preset.js",
+    "./tsconfig": "./tsconfig.json"
+  }
+}

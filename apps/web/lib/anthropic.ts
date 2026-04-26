@@ -126,7 +126,6 @@ export async function interpretMoment(params: {
 
   let parsed: unknown;
   try {
-    // Strip any accidental markdown fences
     const clean = text.replace(/```json\n?|\n?```/g, "").trim();
     parsed = JSON.parse(clean);
   } catch {
@@ -160,7 +159,12 @@ Respond with ONLY valid JSON, no preamble:
 export async function explainMatches(params: {
   sourceMomentDescriptor: MomentDescriptor;
   sourceTrack: { title: string; artist: string };
-  matches: Array<{ spotify_id: string; title: string; artist: string; similarity_score: number }>;
+  matches: Array<{
+    spotify_id: string;
+    title: string;
+    artist: string;
+    similarity_score: number;
+  }>;
 }): Promise<Map<string, string>> {
   const { sourceMomentDescriptor: descriptor, sourceTrack, matches } = params;
 
@@ -174,7 +178,10 @@ export async function explainMatches(params: {
   ].join(" ");
 
   const matchList = matches
-    .map((m) => `- spotify_id: ${m.spotify_id}, title: "${m.title}", artist: ${m.artist}`)
+    .map(
+      (m) =>
+        `- spotify_id: ${m.spotify_id}, title: "${m.title}", artist: ${m.artist}`
+    )
     .join("\n");
 
   const userPrompt = `Source moment:\n${sourceDesc}\n\nMatched songs:\n${matchList}\n\nExplain why each matched song shares a similar moment.`;
@@ -203,7 +210,6 @@ export async function explainMatches(params: {
     });
     return map;
   } catch {
-    // Fallback: return empty map, UI will show generic explanation
     return new Map();
   }
 }
