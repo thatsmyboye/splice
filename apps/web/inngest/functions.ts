@@ -3,7 +3,7 @@
  * apps/web/inngest/functions.ts
  *
  * Background job definitions.
- * Register these in apps/web/app/api/inngest/route.ts
+ * Registered in apps/web/app/api/inngest/route.ts
  */
 
 import { inngest } from "./client";
@@ -30,7 +30,7 @@ export const analyzeTrack = inngest.createFunction(
     retries: 3,
     throttle: {
       limit: 10,
-      period: "1m",            // Max 10 concurrent analyses per minute
+      period: "1m",
     },
   },
   { event: "analysis/track.requested" },
@@ -40,7 +40,6 @@ export const analyzeTrack = inngest.createFunction(
       previewUrl: string;
     };
 
-    // Mark job as processing
     await step.run("mark-processing", async () => {
       await supabaseAdmin
         .from("analysis_jobs")
@@ -48,7 +47,6 @@ export const analyzeTrack = inngest.createFunction(
         .eq("spotify_id", spotifyId);
     });
 
-    // Call analysis service
     const analysis = await step.run("call-analysis-service", async () => {
       const response = await fetch(`${ANALYSIS_SERVICE_URL}/analyze`, {
         method: "POST",
@@ -67,30 +65,29 @@ export const analyzeTrack = inngest.createFunction(
       return response.json();
     });
 
-    // Store features in Supabase
     await step.run("store-features", async () => {
       const { error } = await supabaseAdmin
         .from("track_features")
-        .upsert({
-          spotify_id: spotifyId,
-          source: "on_demand",
-          analysis_version: "1.0",
-          bpm: analysis.bpm,
-          key_name: analysis.key_name,
-          key_mode: analysis.key_mode,
-          danceability: analysis.danceability,
-          dynamic_complexity: analysis.dynamic_complexity,
-          segments: analysis.segments,
-          embedding: analysis.embedding,
-          analyzed_at: new Date().toISOString(),
-        }, {
-          onConflict: "spotify_id",
-        });
+        .upsert(
+          {
+            spotify_id: spotifyId,
+            source: "on_demand",
+            analysis_version: "1.0",
+            bpm: analysis.bpm,
+            key_name: analysis.key_name,
+            key_mode: analysis.key_mode,
+            danceability: analysis.danceability,
+            dynamic_complexity: analysis.dynamic_complexity,
+            segments: analysis.segments,
+            embedding: analysis.embedding,
+            analyzed_at: new Date().toISOString(),
+          },
+          { onConflict: "spotify_id" }
+        );
 
       if (error) throw new Error(`Supabase insert failed: ${error.message}`);
     });
 
-    // Mark job complete
     await step.run("mark-complete", async () => {
       await supabaseAdmin
         .from("analysis_jobs")
@@ -103,7 +100,7 @@ export const analyzeTrack = inngest.createFunction(
 );
 
 // ============================================================
-// analysis/track.failed (error handler)
+// inngest/function.failed
 // Marks job as failed in DB when all retries are exhausted.
 // ============================================================
 

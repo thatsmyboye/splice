@@ -99,7 +99,7 @@ create table public.moments (
   user_description    text,                           -- free-text from the user
 
   -- Claude-interpreted descriptor (stored as JSONB)
-  -- Shape: MomentDescriptor (see types/index.ts)
+  -- Shape: MomentDescriptor (see packages/types/index.ts)
   moment_descriptor   jsonb,
 
   -- Embedding derived from moment_descriptor (for future moment-to-moment matching)
