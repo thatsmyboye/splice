@@ -43,56 +43,119 @@ curl -X POST http://localhost:8000/analyze \
 
 ## AcousticBrainz Bulk Import
 
+One-time setup that pre-populates `track_features` with ~500K tracks so the app
+has a searchable corpus before any user triggers on-demand analysis.
+
 ### Prerequisites
+
 ```bash
-pip install supabase pandas tqdm
+pip install supabase numpy tqdm
+# zstd is required to extract the archives:
+# macOS:  brew install zstd
+# Ubuntu: sudo apt install zstd
 ```
 
-### Download the data
-Go to https://acousticbrainz.org/download
+### Step 1 — Download the archive(s)
 
-Download the **lowlevel CSV** file:
-- `acousticbrainz-lowlevel-features.tar.bz2` (~2GB compressed, ~8GB uncompressed)
-
-Extract:
-```bash
-tar -xjf acousticbrainz-lowlevel-features.tar.bz2
+The low-level JSON dump lives at:
+```
+https://data.metabrainz.org/pub/musicbrainz/acousticbrainz/dumps/acousticbrainz-lowlevel-json-20220623/
 ```
 
-### Run the import
+There are 29 files (`json-0` through `json-28`), each ~120 GB uncompressed.
+**You only need 1–2 files** for a 500K-track corpus.
+
+- For a quick start, download `json-0` (~120 GB uncompressed, ~30–40 GB compressed).
+- For broader MBID coverage, also grab `json-14` (the midpoint of the range).
+
+```bash
+# Example — adjust filename/URL as needed
+wget https://data.metabrainz.org/pub/musicbrainz/acousticbrainz/dumps/acousticbrainz-lowlevel-json-20220623/acousticbrainz-lowlevel-json-20220623-json-0.tar.zst
+```
+
+### Step 2 — Extract
+
+```bash
+tar --use-compress-program=unzstd \
+    -xf acousticbrainz-lowlevel-json-20220623-json-0.tar.zst
+```
+
+This creates a directory tree organized by MBID:
+```
+0/
+  00/
+    00xxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.json
+  01/
+    ...
+```
+
+Each `.json` file is one AcousticBrainz recording submission containing the
+full low-level feature output from Essentia.
+
+### Step 3 — Run the import
+
 ```bash
 python import_acousticbrainz.py \
-  --input acousticbrainz-lowlevel-features.csv \
+  --input ./acousticbrainz-lowlevel-json-20220623-json-0 \
   --supabase-url https://YOUR_PROJECT.supabase.co \
   --supabase-key YOUR_SERVICE_ROLE_KEY \
   --limit 500000
 ```
 
 Options:
-- `--limit N`: import at most N rows (default 500K)
-- `--offset N`: skip first N rows (useful for resuming interrupted imports)
-- `--batch-size N`: rows per Supabase batch insert (default 500)
 
-### Verify the import
-In Supabase SQL editor:
+| Flag | Default | Description |
+|---|---|---|
+| `--limit N` | 500000 | Stop after N records |
+| `--offset N` | 0 | Skip first N files (resume an interrupted run) |
+| `--batch-size N` | 500 | Rows per Supabase upsert call |
+
+Runtime: ~60–120 min for 500K rows. The script is safe to interrupt and
+resume — records are upserted on `mbid`, so duplicates are silently skipped.
+
+### Step 4 — Verify
+
+Run in the Supabase SQL editor:
+
 ```sql
 SELECT
-  count(*) as total,
+  count(*)          AS total,
   source,
-  min(created_at) as first_imported,
-  max(created_at) as last_imported
+  min(created_at)   AS first_imported,
+  max(created_at)   AS last_imported
 FROM track_features
 GROUP BY source;
 ```
 
-### Notes on the AB data
-- AcousticBrainz CSV dump contains track-level aggregates only (no segments)
-- MBIDs in the AB dataset link to MusicBrainz recordings
-- Tracks imported from AB use `spotify_id` prefixed with `ab:` (e.g. `ab:abc123-...mbid...`)
-- When a user plays a Spotify track, the system checks for a matching MBID to find AB features,
-  then falls back to on-demand analysis via Spotify 30s preview if no match found
-- The embedding quality for AB tracks is lower than on-demand analysis (fewer features available)
-  but still useful for cold-start catalog coverage
+Expected: `~500000` rows with `source = 'acousticbrainz'`.
+
+### Notes on the import
+
+- **Which files to download**: each archive covers MBIDs whose leading hex
+  character falls in a particular range. `json-0` contains MBIDs starting with
+  `0x`; `json-14` covers roughly `ex`. Any single archive contains well over
+  500K recordings, so one file is sufficient for an initial corpus.
+
+- **Embedding quality**: the JSON import uses the full Essentia low-level
+  feature set (MFCC, GFCC, chroma, bark bands, spectral contrast, etc.) to
+  build genuine 128-dim embeddings. This is significantly richer than the old
+  CSV-based import, which only had ~30 real dimensions.
+
+- **Multiple submissions**: AcousticBrainz sometimes has several submissions for
+  the same MBID (e.g. `{mbid}-0.json`, `{mbid}-1.json`). The importer keeps
+  only submission `0` (the most-played version) and ignores the rest.
+
+- **Spotify linkage**: imported rows use `spotify_id = "ab:{mbid}"` as a
+  placeholder. When a user searches for a Spotify track, the app looks up the
+  corresponding MusicBrainz recording ID and joins on `mbid` to find the
+  pre-indexed features. If no match is found, on-demand analysis via the
+  Spotify 30s preview URL is triggered instead.
+
+- **analysis_version**: rows imported by this script are tagged `2.0`. If you
+  re-run the import after a schema change, bump this value so you can
+  distinguish old rows.
+
+---
 
 ## Endpoints
 
@@ -100,6 +163,6 @@ GROUP BY source;
 |---|---|---|
 | GET | /health | Health check |
 | POST | /analyze | Analyze a 30s audio preview URL |
-| POST | /embed | Convert a MomentDescriptor to a 64-dim vector |
+| POST | /embed | Convert a MomentDescriptor to a 128-dim vector |
 
 All non-health endpoints require `X-Service-Secret` header.
