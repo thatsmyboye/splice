@@ -170,4 +170,7 @@ export interface MatchRequest {
 export interface MatchResponse {
   matches: MomentMatch[];
   cachedAt: string | null;
+  /** True when the source track's audio analysis is still in progress.
+   *  The client should poll /api/analyze?spotifyId={id} and retry once complete. */
+  analysis_pending: boolean;
 }
