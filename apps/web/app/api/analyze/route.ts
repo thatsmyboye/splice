@@ -10,6 +10,39 @@ function getServiceClient() {
   );
 }
 
+export async function GET(request: NextRequest) {
+  const spotifyId = request.nextUrl.searchParams.get("spotifyId");
+  if (!spotifyId) {
+    return NextResponse.json({ error: "Missing spotifyId" }, { status: 400 });
+  }
+
+  const serviceSupabase = getServiceClient();
+
+  const { data: existing } = await serviceSupabase
+    .from("track_features")
+    .select("spotify_id")
+    .eq("spotify_id", spotifyId)
+    .single();
+
+  if (existing) {
+    return NextResponse.json({ status: "complete", jobId: null });
+  }
+
+  const { data: job } = await serviceSupabase
+    .from("analysis_jobs")
+    .select("id, status, error_message")
+    .eq("spotify_id", spotifyId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .single();
+
+  if (!job) {
+    return NextResponse.json({ status: "not_started", jobId: null });
+  }
+
+  return NextResponse.json({ status: job.status, jobId: job.id, error: job.error_message });
+}
+
 const RequestSchema = z.object({
   spotifyId: z.string().min(1),
   previewUrl: z.string().url(),

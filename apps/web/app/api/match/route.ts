@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { explainMatches } from "@/lib/anthropic";
+import { getMBRecordings } from "@/lib/musicbrainz";
 import { z } from "zod";
 import type { MomentMatch, MomentDescriptor } from "@splice/types";
 
@@ -45,6 +46,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       matches: cached.results,
       cachedAt: cached.created_at,
+      analysis_pending: false,
     });
   }
 
@@ -67,8 +69,20 @@ export async function POST(request: NextRequest) {
     .single();
 
   if (!sourceFeatures?.embedding) {
-    // Analysis not yet complete — return empty (client should retry)
-    return NextResponse.json({ matches: [], cachedAt: null });
+    // Check if analysis is in flight so the client knows to poll and retry
+    const { data: job } = await serviceSupabase
+      .from("analysis_jobs")
+      .select("status")
+      .eq("spotify_id", sourceSpotifyId)
+      .in("status", ["pending", "processing"])
+      .limit(1)
+      .single();
+
+    return NextResponse.json({
+      matches: [],
+      cachedAt: null,
+      analysis_pending: !!job,
+    });
   }
 
   // pgvector similarity search via RPC
@@ -89,21 +103,86 @@ export async function POST(request: NextRequest) {
   }
 
   if (!rawMatches || rawMatches.length === 0) {
-    return NextResponse.json({ matches: [], cachedAt: null });
+    return NextResponse.json({ matches: [], cachedAt: null, analysis_pending: false });
   }
 
-  // Fetch track metadata for results
-  const matchSpotifyIds = rawMatches.map(
-    (m: { spotify_id: string }) => m.spotify_id
-  );
-  const { data: trackMetadata } = await serviceSupabase
-    .from("tracks")
-    .select("spotify_id, title, artist, artwork_url, preview_url")
-    .in("spotify_id", matchSpotifyIds);
+  // Split results: real Spotify IDs vs AcousticBrainz ("ab:{mbid}") prefixed
+  const spotifyIds: string[] = [];
+  const abMbids: string[] = [];
+
+  for (const m of rawMatches as Array<{ spotify_id: string }>) {
+    if (m.spotify_id.startsWith("ab:")) {
+      abMbids.push(m.spotify_id.slice(3)); // strip "ab:" prefix
+    } else {
+      spotifyIds.push(m.spotify_id);
+    }
+  }
+
+  // Fetch Spotify track metadata from our tracks table
+  const { data: spotifyMeta } = spotifyIds.length
+    ? await serviceSupabase
+        .from("tracks")
+        .select("spotify_id, title, artist, artwork_url, preview_url")
+        .in("spotify_id", spotifyIds)
+    : { data: [] };
 
   const trackMap = new Map(
-    (trackMetadata ?? []).map((t) => [t.spotify_id, t])
+    (spotifyMeta ?? []).map((t) => [
+      t.spotify_id,
+      { title: t.title, artist: t.artist, artwork_url: t.artwork_url, preview_url: t.preview_url },
+    ])
   );
+
+  // Resolve AcousticBrainz metadata: check cache first, then MusicBrainz API
+  if (abMbids.length > 0) {
+    const { data: cached_mb } = await serviceSupabase
+      .from("musicbrainz_cache")
+      .select("mbid, title, artist")
+      .in("mbid", abMbids);
+
+    const cachedMbids = new Set((cached_mb ?? []).map((r) => r.mbid));
+
+    for (const row of cached_mb ?? []) {
+      trackMap.set(`ab:${row.mbid}`, {
+        title: row.title,
+        artist: row.artist,
+        artwork_url: null,
+        preview_url: null,
+      });
+    }
+
+    const uncachedMbids = abMbids.filter((id) => !cachedMbids.has(id));
+
+    if (uncachedMbids.length > 0) {
+      const fetched = await getMBRecordings(uncachedMbids);
+
+      const newRows = Array.from(fetched.values()).map((info) => ({
+        mbid: info.mbid,
+        title: info.title,
+        artist: info.artist,
+      }));
+
+      if (newRows.length > 0) {
+        // Cache for future requests — ignore errors
+        try {
+          await serviceSupabase
+            .from("musicbrainz_cache")
+            .upsert(newRows, { onConflict: "mbid" });
+        } catch {
+          // Non-fatal: cache miss on next request will re-fetch
+        }
+      }
+
+      for (const [mbid, info] of fetched) {
+        trackMap.set(`ab:${mbid}`, {
+          title: info.title,
+          artist: info.artist,
+          artwork_url: null,
+          preview_url: null,
+        });
+      }
+    }
+  }
 
   // Get source track info for Claude context
   const { data: sourceTrackData } = await serviceSupabase
@@ -114,10 +193,10 @@ export async function POST(request: NextRequest) {
 
   // Claude re-ranking explanations (top 10 only to save tokens)
   const descriptor = moment.moment_descriptor as MomentDescriptor;
-  const matchesForClaude = rawMatches
-    .filter((m: { spotify_id: string }) => trackMap.has(m.spotify_id))
+  const matchesForClaude = (rawMatches as Array<{ spotify_id: string; similarity: number }>)
+    .filter((m) => trackMap.has(m.spotify_id))
     .slice(0, 10)
-    .map((m: { spotify_id: string; similarity: number }) => {
+    .map((m) => {
       const t = trackMap.get(m.spotify_id)!;
       return {
         spotify_id: m.spotify_id,
@@ -143,35 +222,39 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // Build final results
-  const matches: MomentMatch[] = rawMatches
-    .filter((m: { spotify_id: string }) => trackMap.has(m.spotify_id))
-    .map(
-      (m: {
-        spotify_id: string;
-        similarity: number;
-        segments: Array<{ start_s: number }> | null;
-      }) => {
-        const t = trackMap.get(m.spotify_id)!;
-        const firstSegmentStart = m.segments?.[0]?.start_s ?? 0;
-        return {
-          spotify_id: m.spotify_id,
-          title: t.title,
-          artist: t.artist,
-          artwork_url: t.artwork_url ?? null,
-          preview_url: t.preview_url ?? null,
-          timestamp_s: firstSegmentStart,
-          similarity_score: m.similarity,
-          claude_explanation: explanations.get(m.spotify_id) ?? "",
-          spotify_embed_url: `https://open.spotify.com/embed/track/${m.spotify_id}`,
-        };
-      }
-    );
+  // Build final results — include both Spotify and AcousticBrainz tracks
+  const matches: MomentMatch[] = (
+    rawMatches as Array<{
+      spotify_id: string;
+      similarity: number;
+      segments: Array<{ start_s: number }> | null;
+    }>
+  )
+    .filter((m) => trackMap.has(m.spotify_id))
+    .map((m) => {
+      const t = trackMap.get(m.spotify_id)!;
+      const firstSegmentStart = m.segments?.[0]?.start_s ?? 0;
+      const isAB = m.spotify_id.startsWith("ab:");
+      return {
+        spotify_id: m.spotify_id,
+        title: t.title,
+        artist: t.artist,
+        artwork_url: t.artwork_url,
+        preview_url: t.preview_url,
+        timestamp_s: firstSegmentStart,
+        similarity_score: m.similarity,
+        claude_explanation: explanations.get(m.spotify_id) ?? "",
+        // AcousticBrainz tracks link to MusicBrainz instead of Spotify
+        spotify_embed_url: isAB
+          ? `https://musicbrainz.org/recording/${m.spotify_id.slice(3)}`
+          : `https://open.spotify.com/embed/track/${m.spotify_id}`,
+      };
+    });
 
   // Cache results (7-day TTL set by DB default)
   await serviceSupabase
     .from("moment_matches")
     .upsert({ moment_id: momentId, results: matches }, { onConflict: "moment_id" });
 
-  return NextResponse.json({ matches, cachedAt: null });
+  return NextResponse.json({ matches, cachedAt: null, analysis_pending: false });
 }

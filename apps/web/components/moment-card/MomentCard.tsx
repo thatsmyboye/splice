@@ -55,11 +55,15 @@ export function MomentCard({ match }: MomentCardProps) {
       </div>
 
       <a
-        href={`https://open.spotify.com/track/${match.spotify_id}`}
+        href={
+          match.spotify_id.startsWith("ab:")
+            ? `https://musicbrainz.org/recording/${match.spotify_id.slice(3)}`
+            : `https://open.spotify.com/track/${match.spotify_id}`
+        }
         target="_blank"
         rel="noopener noreferrer"
         className="text-muted-foreground hover:text-foreground shrink-0 mt-0.5"
-        title="Open in Spotify"
+        title={match.spotify_id.startsWith("ab:") ? "Open on MusicBrainz" : "Open in Spotify"}
       >
         <ExternalLink className="h-4 w-4" />
       </a>

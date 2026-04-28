@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import type { SpotifyTrack, MomentMatch, MomentDescriptor } from "@splice/types";
@@ -11,7 +11,10 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ArrowLeft, Loader2, Music } from "lucide-react";
 
-type Stage = "select" | "loading" | "results" | "error";
+type Stage = "select" | "loading" | "analyzing" | "results" | "error";
+
+const POLL_INTERVAL_MS = 3000;
+const POLL_MAX_ATTEMPTS = 20; // 60s total
 
 interface DiscoverClientProps {
   track: SpotifyTrack;
@@ -24,6 +27,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
   const [descriptor, setDescriptor] = useState<MomentDescriptor | null>(null);
   const [matches, setMatches] = useState<MomentMatch[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const artwork = track.album.images[0]?.url;
   const artist = track.artists.map((a) => a.name).join(", ");
@@ -33,9 +37,73 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
     setTimestamp(ts);
   }, []);
 
+  const stopPolling = () => {
+    if (pollRef.current) {
+      clearTimeout(pollRef.current);
+      pollRef.current = null;
+    }
+  };
+
+  const fetchMatches = async (momentId: string): Promise<{ done: boolean; pending: boolean }> => {
+    const matchRes = await fetch("/api/match", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ momentId, sourceSpotifyId: track.id }),
+    });
+
+    if (!matchRes.ok) {
+      const err = await matchRes.json().catch(() => ({}));
+      throw new Error(err.error ?? "Matching failed");
+    }
+
+    const { matches: m, analysis_pending } = await matchRes.json();
+
+    if (analysis_pending) {
+      return { done: false, pending: true };
+    }
+
+    setMatches(m);
+    setStage("results");
+    return { done: true, pending: false };
+  };
+
+  const pollUntilReady = (momentId: string, attemptsLeft: number) => {
+    if (attemptsLeft <= 0) {
+      setMatches([]);
+      setStage("results");
+      return;
+    }
+
+    pollRef.current = setTimeout(async () => {
+      try {
+        // Check job status before re-querying match
+        const statusRes = await fetch(
+          `/api/analyze?spotifyId=${encodeURIComponent(track.id)}`
+        );
+        const { status } = await statusRes.json();
+
+        if (status === "complete") {
+          const { done } = await fetchMatches(momentId);
+          if (!done) {
+            // Analysis marked complete but embedding not yet queryable — retry once more
+            pollUntilReady(momentId, attemptsLeft - 1);
+          }
+        } else if (status === "failed") {
+          setMatches([]);
+          setStage("results");
+        } else {
+          pollUntilReady(momentId, attemptsLeft - 1);
+        }
+      } catch {
+        pollUntilReady(momentId, attemptsLeft - 1);
+      }
+    }, POLL_INTERVAL_MS);
+  };
+
   const handleFindMoment = async () => {
     if (!canSubmit) return;
 
+    stopPolling();
     setStage("loading");
     setError(null);
     setMatches([]);
@@ -60,7 +128,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
       const { descriptor: desc, momentId } = await interpretRes.json();
       setDescriptor(desc);
 
-      // Fire-and-forget analysis trigger if track has a preview
+      // Trigger analysis if track has a preview (fire-and-forget)
       if (track.preview_url) {
         fetch("/api/analyze", {
           method: "POST",
@@ -72,21 +140,15 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
         }).catch(() => {});
       }
 
-      const matchRes = await fetch("/api/match", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ momentId, sourceSpotifyId: track.id }),
-      });
+      const { done, pending } = await fetchMatches(momentId);
 
-      if (!matchRes.ok) {
-        const err = await matchRes.json().catch(() => ({}));
-        throw new Error(err.error ?? "Matching failed");
+      if (!done && pending) {
+        // Analysis is in progress — switch to "analyzing" stage and poll
+        setStage("analyzing");
+        pollUntilReady(momentId, POLL_MAX_ATTEMPTS);
       }
-
-      const { matches: m } = await matchRes.json();
-      setMatches(m);
-      setStage("results");
     } catch (err) {
+      stopPolling();
       setError(err instanceof Error ? err.message : "Something went wrong");
       setStage("error");
     }
@@ -173,13 +235,18 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
           />
           <Button
             onClick={handleFindMoment}
-            disabled={!canSubmit || stage === "loading"}
+            disabled={!canSubmit || stage === "loading" || stage === "analyzing"}
             className="w-full h-12 text-base"
           >
             {stage === "loading" ? (
               <>
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                Finding similar moments...
+                Interpreting moment...
+              </>
+            ) : stage === "analyzing" ? (
+              <>
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                Analyzing audio...
               </>
             ) : (
               "Find similar moments →"
@@ -195,8 +262,13 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
         )}
 
         {/* Loading skeleton */}
-        {stage === "loading" && (
+        {(stage === "loading" || stage === "analyzing") && (
           <div className="space-y-3">
+            {stage === "analyzing" && (
+              <p className="text-sm text-muted-foreground text-center">
+                Extracting audio features from the 30s preview — this takes 5–15s the first time.
+              </p>
+            )}
             {[1, 2, 3].map((i) => (
               <div key={i} className="flex gap-4 p-4 border border-border rounded-lg">
                 <Skeleton className="w-14 h-14 rounded shrink-0" />
