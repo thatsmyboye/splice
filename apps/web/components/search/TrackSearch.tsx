@@ -14,6 +14,7 @@ export function TrackSearch() {
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const requestIdRef = useRef(0);
 
   useEffect(() => {
     if (!query.trim()) {
@@ -23,6 +24,7 @@ export function TrackSearch() {
     }
 
     clearTimeout(timeoutRef.current);
+    const currentRequestId = ++requestIdRef.current;
     timeoutRef.current = setTimeout(async () => {
       setLoading(true);
       try {
@@ -31,12 +33,19 @@ export function TrackSearch() {
         );
         if (!res.ok) throw new Error("Search failed");
         const data = await res.json();
-        setResults(data.tracks ?? []);
-        setOpen(true);
+        // Ignore stale responses so fast typing doesn't flash old results
+        if (currentRequestId !== requestIdRef.current) return;
+        const nextResults = data.tracks ?? [];
+        setResults(nextResults);
+        setOpen(nextResults.length > 0 || query.length > 1);
       } catch {
+        if (currentRequestId !== requestIdRef.current) return;
         setResults([]);
+        setOpen(query.length > 1);
       } finally {
-        setLoading(false);
+        if (currentRequestId === requestIdRef.current) {
+          setLoading(false);
+        }
       }
     }, 350);
 
@@ -58,7 +67,7 @@ export function TrackSearch() {
           onChange={(e) => setQuery(e.target.value)}
           onFocus={() => results.length > 0 && setOpen(true)}
           onBlur={() => {
-            timeoutRef.current = setTimeout(() => setOpen(false), 150);
+            timeoutRef.current = setTimeout(() => setOpen(false), 120);
           }}
           placeholder="Search for a song..."
           className="pl-10 h-12 text-base bg-secondary border-border"
