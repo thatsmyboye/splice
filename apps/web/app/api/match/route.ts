@@ -164,11 +164,13 @@ export async function POST(request: NextRequest) {
 
       if (newRows.length > 0) {
         // Cache for future requests — ignore errors
-        await serviceSupabase
-          .from("musicbrainz_cache")
-          .upsert(newRows, { onConflict: "mbid" })
-          .throwOnError()
-          .catch(() => {});
+        try {
+          await serviceSupabase
+            .from("musicbrainz_cache")
+            .upsert(newRows, { onConflict: "mbid" });
+        } catch {
+          // Non-fatal: cache miss on next request will re-fetch
+        }
       }
 
       for (const [mbid, info] of fetched) {
