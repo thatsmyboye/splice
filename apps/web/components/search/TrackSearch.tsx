@@ -36,7 +36,8 @@ export function TrackSearch() {
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
-  const timeoutRef = useRef<ReturnType<typeof setTimeout>>();
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+  const closeRef = useRef<ReturnType<typeof setTimeout>>();
   const requestIdRef = useRef(0);
 
   useEffect(() => {
@@ -47,9 +48,9 @@ export function TrackSearch() {
       return;
     }
 
-    clearTimeout(timeoutRef.current);
+    clearTimeout(debounceRef.current);
     const currentRequestId = ++requestIdRef.current;
-    timeoutRef.current = setTimeout(async () => {
+    debounceRef.current = setTimeout(async () => {
       setLoading(true);
       try {
         const res = await fetch(
@@ -75,7 +76,7 @@ export function TrackSearch() {
       }
     }, 350);
 
-    return () => clearTimeout(timeoutRef.current);
+    return () => clearTimeout(debounceRef.current);
   }, [query]);
 
   const handleSelect = (track: SpotifyTrack) => {
@@ -93,6 +94,7 @@ export function TrackSearch() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onFocus={() => {
+            clearTimeout(closeRef.current);
             if (results.length > 0) {
               setOpen(true);
               setActiveIndex((prev) =>
@@ -125,7 +127,7 @@ export function TrackSearch() {
             }
           }}
           onBlur={() => {
-            timeoutRef.current = setTimeout(() => setOpen(false), 120);
+            closeRef.current = setTimeout(() => setOpen(false), 120);
           }}
           placeholder="Search for a song..."
           className="pl-10 h-12 text-base bg-secondary border-border"

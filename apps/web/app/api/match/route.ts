@@ -251,10 +251,14 @@ export async function POST(request: NextRequest) {
       };
     });
 
-  // Cache results (7-day TTL set by DB default)
+  // Cache results with a fresh 7-day TTL
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
   await serviceSupabase
     .from("moment_matches")
-    .upsert({ moment_id: momentId, results: matches }, { onConflict: "moment_id" });
+    .upsert(
+      { moment_id: momentId, results: matches, expires_at: expiresAt },
+      { onConflict: "moment_id" }
+    );
 
   return NextResponse.json({ matches, cachedAt: null, analysis_pending: false });
 }
