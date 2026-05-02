@@ -8,9 +8,10 @@ interface MomentCardProps {
 }
 
 export function MomentCard({ match }: MomentCardProps) {
-  const minutes = Math.floor(match.timestamp_s / 60);
-  const seconds = Math.floor(match.timestamp_s % 60);
-  const timeStr = `${minutes}:${seconds.toString().padStart(2, "0")}`;
+  const timeStr =
+    match.timestamp_s !== null
+      ? `${Math.floor(match.timestamp_s / 60)}:${Math.floor(match.timestamp_s % 60).toString().padStart(2, "0")}`
+      : null;
   const similarityPct = Math.round(match.similarity_score * 100);
 
   return (
@@ -42,10 +43,12 @@ export function MomentCard({ match }: MomentCardProps) {
           </Badge>
         </div>
 
-        <p className="text-xs text-muted-foreground">
-          Similar moment at{" "}
-          <span className="text-foreground font-mono">{timeStr}</span>
-        </p>
+        {timeStr !== null && (
+          <p className="text-xs text-muted-foreground">
+            Similar moment at{" "}
+            <span className="text-foreground font-mono">{timeStr}</span>
+          </p>
+        )}
 
         {match.claude_explanation && (
           <p className="text-sm text-muted-foreground/80 italic leading-snug">

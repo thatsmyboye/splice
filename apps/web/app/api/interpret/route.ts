@@ -36,6 +36,7 @@ function getServiceClient() {
 const RequestSchema = z.object({
   trackId: z.string().min(1),
   timestamp_s: z.number().min(0).optional(),
+  timestamp_end_s: z.number().min(0).optional(),
   description: z.string().min(1).optional(),
   trackMetadata: z.unknown().optional(),
 });
@@ -58,7 +59,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
-  const { trackId, timestamp_s, description, trackMetadata } = parsed.data;
+  const { trackId, timestamp_s, timestamp_end_s, description, trackMetadata } = parsed.data;
 
   if (timestamp_s === undefined && !description) {
     return NextResponse.json(
@@ -106,7 +107,7 @@ export async function POST(request: NextRequest) {
   // Claude moment interpretation
   let descriptor;
   try {
-    descriptor = await interpretMoment({ track, timestamp_s, description });
+    descriptor = await interpretMoment({ track, timestamp_s, timestamp_end_s, description });
   } catch (err) {
     return NextResponse.json(
       {
@@ -124,6 +125,7 @@ export async function POST(request: NextRequest) {
       user_id: user?.id ?? null,
       track_id: trackRecord?.id ?? null,
       timestamp_start_s: timestamp_s ?? null,
+      timestamp_end_s: timestamp_end_s ?? null,
       user_description: description ?? null,
       moment_descriptor: descriptor,
       is_saved: false,

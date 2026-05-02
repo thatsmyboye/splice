@@ -11,6 +11,7 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ArrowLeft, Loader2, Music } from "lucide-react";
 import { TrackTimeline } from "@/components/waveform/TrackTimeline";
+import type { MomentSelection } from "@/components/waveform/TrackTimeline";
 
 type Stage = "select" | "loading" | "analyzing" | "results" | "error";
 
@@ -23,7 +24,7 @@ interface DiscoverClientProps {
 
 export function DiscoverClient({ track }: DiscoverClientProps) {
   const [stage, setStage] = useState<Stage>("select");
-  const [timestamp, setTimestamp] = useState<number | null>(null);
+  const [selection, setSelection] = useState<MomentSelection | null>(null);
   const [description, setDescription] = useState("");
   const [descriptor, setDescriptor] = useState<MomentDescriptor | null>(null);
   const [matches, setMatches] = useState<MomentMatch[]>([]);
@@ -32,10 +33,10 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
   const artwork = track.album.images[0]?.url;
   const artist = track.artists.map((a) => a.name).join(", ");
-  const canSubmit = timestamp !== null || description.trim().length > 0;
+  const canSubmit = selection !== null || description.trim().length > 0;
 
-  const handleTimestampSelect = useCallback((ts: number) => {
-    setTimestamp(ts);
+  const handleMomentSelect = useCallback((sel: MomentSelection) => {
+    setSelection(sel);
   }, []);
 
   const stopPolling = () => {
@@ -59,9 +60,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
     const { matches: m, analysis_pending } = await matchRes.json();
 
-    if (analysis_pending) {
-      return { done: false, pending: true };
-    }
+    if (analysis_pending) return { done: false, pending: true };
 
     setMatches(m);
     setStage("results");
@@ -77,7 +76,6 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
     pollRef.current = setTimeout(async () => {
       try {
-        // Check job status before re-querying match
         const statusRes = await fetch(
           `/api/analyze?spotifyId=${encodeURIComponent(track.id)}`
         );
@@ -85,10 +83,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
         if (status === "complete") {
           const { done } = await fetchMatches(momentId);
-          if (!done) {
-            // Analysis marked complete but embedding not yet queryable — retry once more
-            pollUntilReady(momentId, attemptsLeft - 1);
-          }
+          if (!done) pollUntilReady(momentId, attemptsLeft - 1);
         } else if (status === "failed") {
           setMatches([]);
           setStage("results");
@@ -115,7 +110,8 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           trackId: track.id,
-          timestamp_s: timestamp ?? undefined,
+          timestamp_s: selection?.start_s ?? undefined,
+          timestamp_end_s: selection?.end_s ?? undefined,
           description: description.trim() || undefined,
           trackMetadata: track,
         }),
@@ -129,22 +125,17 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
       const { descriptor: desc, momentId } = await interpretRes.json();
       setDescriptor(desc);
 
-      // Trigger analysis if track has a preview (fire-and-forget)
       if (track.preview_url) {
         fetch("/api/analyze", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            spotifyId: track.id,
-            previewUrl: track.preview_url,
-          }),
+          body: JSON.stringify({ spotifyId: track.id, previewUrl: track.preview_url }),
         }).catch(() => {});
       }
 
       const { done, pending } = await fetchMatches(momentId);
 
       if (!done && pending) {
-        // Analysis is in progress — switch to "analyzing" stage and poll
         setStage("analyzing");
         pollUntilReady(momentId, POLL_MAX_ATTEMPTS);
       }
@@ -155,19 +146,21 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
     }
   };
 
-  const formatTimestamp = (ts: number) => {
-    const m = Math.floor(ts / 60);
-    const s = Math.floor(ts % 60);
-    return `${m}:${s.toString().padStart(2, "0")}`;
+  const formatSelection = (sel: MomentSelection) => {
+    const fmt = (s: number) => {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return `${m}:${sec.toString().padStart(2, "0")}`;
+    };
+    return sel.end_s !== undefined
+      ? `${fmt(sel.start_s)} – ${fmt(sel.end_s)}`
+      : fmt(sel.start_s);
   };
 
   return (
     <div className="min-h-screen">
       <header className="sticky top-0 z-10 border-b border-border bg-background/80 backdrop-blur-sm px-4 py-3 flex items-center gap-4">
-        <Link
-          href="/"
-          className="text-muted-foreground hover:text-foreground transition-colors"
-        >
+        <Link href="/" className="text-muted-foreground hover:text-foreground transition-colors">
           <ArrowLeft className="h-5 w-5" />
         </Link>
         <span className="font-semibold text-lg tracking-tight">splice</span>
@@ -190,50 +183,45 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
             </div>
           )}
           <div className="min-w-0">
-            <h1 className="text-2xl font-bold leading-tight truncate">
-              {track.name}
-            </h1>
+            <h1 className="text-2xl font-bold leading-tight truncate">{track.name}</h1>
             <p className="text-muted-foreground truncate">{artist}</p>
-            <p className="text-sm text-muted-foreground/70 truncate">
-              {track.album.name}
-            </p>
+            <p className="text-sm text-muted-foreground/70 truncate">{track.album.name}</p>
           </div>
         </div>
 
         {/* Waveform scrubber / track timeline */}
         {track.preview_url ? (
           <div className="space-y-2">
-            {timestamp !== null && (
+            {selection !== null && (
               <p className="text-sm text-primary font-medium">
-                Moment marked at {formatTimestamp(timestamp)}
+                Moment marked at {formatSelection(selection)}
               </p>
             )}
-            {timestamp === null && (
+            {selection === null && (
               <p className="text-sm text-muted-foreground">
                 Scrub to a moment and click &ldquo;Mark this moment&rdquo;
               </p>
             )}
             <WaveformScrubber
               previewUrl={track.preview_url}
-              onTimestampSelect={handleTimestampSelect}
+              onMomentSelect={handleMomentSelect}
             />
           </div>
         ) : (
           <div className="space-y-2">
-            {timestamp !== null && (
+            {selection !== null && (
               <p className="text-sm text-primary font-medium">
-                Moment marked at {formatTimestamp(timestamp)}
+                Moment marked at {formatSelection(selection)}
               </p>
             )}
-            {timestamp === null && (
+            {selection === null && (
               <p className="text-sm text-muted-foreground">
-                No audio preview — scrub the timeline to mark where the moment
-                is in the track
+                No audio preview — scrub the timeline to mark where the moment is in the track
               </p>
             )}
             <TrackTimeline
               durationMs={track.duration_ms}
-              onTimestampSelect={handleTimestampSelect}
+              onMomentSelect={handleMomentSelect}
             />
           </div>
         )}
@@ -309,17 +297,14 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
             {descriptor && (
               <div className="text-sm text-muted-foreground bg-secondary/50 rounded-lg p-3 border border-border/50">
-                <span className="font-medium text-foreground">
-                  Moment interpreted:{" "}
-                </span>
+                <span className="font-medium text-foreground">Moment interpreted: </span>
                 {descriptor.reasoning}
               </div>
             )}
 
             {matches.length === 0 ? (
               <p className="text-sm text-muted-foreground py-8 text-center">
-                No matches found for this moment yet. Try adding a description
-                to sharpen the search.
+                No matches found for this moment yet. Try adding a description to sharpen the search.
               </p>
             ) : (
               <div className="space-y-3">

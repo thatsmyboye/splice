@@ -73,7 +73,7 @@ async function buildClaudeSuggestions(params: {
         artist: t.artists.map((a: { name: string }) => a.name).join(", "),
         artwork_url: t.album?.images?.[0]?.url ?? null,
         preview_url: t.preview_url ?? null,
-        timestamp_s: 0,
+        timestamp_s: null,
         similarity_score: similarity,
         claude_explanation: s.explanation,
         spotify_embed_url: `https://open.spotify.com/embed/track/${t.id}`,
@@ -200,6 +200,17 @@ export async function POST(request: NextRequest) {
     });
   }
 
+  // Fetch segments for matched tracks so we can show a real timestamp
+  const matchedIds = (rawMatches as Array<{ spotify_id: string }>).map((m) => m.spotify_id);
+  const { data: featuresRows } = await serviceSupabase
+    .from("track_features")
+    .select("spotify_id, segments")
+    .in("spotify_id", matchedIds);
+
+  const segmentsMap = new Map<string, Array<{ start_s: number }>>(
+    (featuresRows ?? []).map((f) => [f.spotify_id, f.segments ?? []])
+  );
+
   // Split results: real Spotify IDs vs AcousticBrainz ("ab:{mbid}") prefixed
   const spotifyIds: string[] = [];
   const abMbids: string[] = [];
@@ -317,16 +328,13 @@ export async function POST(request: NextRequest) {
 
   // Build final results — include both Spotify and AcousticBrainz tracks
   const matches: MomentMatch[] = (
-    rawMatches as Array<{
-      spotify_id: string;
-      similarity: number;
-      segments: Array<{ start_s: number }> | null;
-    }>
+    rawMatches as Array<{ spotify_id: string; similarity: number }>
   )
     .filter((m) => trackMap.has(m.spotify_id))
     .map((m) => {
       const t = trackMap.get(m.spotify_id)!;
-      const firstSegmentStart = m.segments?.[0]?.start_s ?? 0;
+      const segments = segmentsMap.get(m.spotify_id);
+      const firstSegmentStart = segments?.[0]?.start_s ?? null;
       const isAB = m.spotify_id.startsWith("ab:");
       return {
         spotify_id: m.spotify_id,

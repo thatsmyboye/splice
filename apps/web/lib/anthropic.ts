@@ -62,7 +62,7 @@ const SuggestMatchesSchema = z.object({
 // Moment interpretation
 // ============================================================
 
-const INTERPRET_SYSTEM_PROMPT = `You are an expert music analyst with deep knowledge of music theory, production techniques, and sonic characteristics. Your task is to interpret a listener's description of a specific musical moment and translate it into a structured set of perceptual audio features.
+const INTERPRET_SYSTEM_PROMPT = `You are an expert music analyst with deep knowledge of music theory, production techniques, and sonic characteristics. Your task is to interpret a listener's selected moment in a song and translate it into a structured set of perceptual audio features.
 
 You must respond with ONLY a valid JSON object matching this exact schema — no preamble, no explanation, no markdown fences:
 
@@ -80,7 +80,7 @@ You must respond with ONLY a valid JSON object matching this exact schema — no
   "emotional_arc": <float 0-1>,
   "emotional_arc_label": <string, e.g. "melancholic and descending", "euphoric and ascending">,
   "confidence": <float 0-1, your confidence in this interpretation>,
-  "reasoning": <string, one sentence explaining your interpretation>
+  "reasoning": <string, one confident sentence characterizing this moment — written as a direct statement, never hedged with words like "likely", "probably", or "suggests">
 }
 
 Scale definitions:
@@ -91,15 +91,16 @@ Scale definitions:
 - textural_density: 0 = solo instrument/single voice, 1 = full ensemble/wall of sound
 - emotional_arc: 0 = descending/grief/resignation, 1 = ascending/release/triumph
 
-Be precise and consistent. A high-energy EDM drop and a loud orchestral climax may both score 0.9 on energy_profile, but differ significantly on timbral_character and structural_position.`;
+Be precise and consistent. A high-energy EDM drop and a loud orchestral climax may both score 0.9 on energy_profile, but differ significantly on timbral_character and structural_position. Base your interpretation on the track metadata, the timestamp's position within the track structure, and any description provided — write the reasoning as a confident characterization, not a guess.`;
 
 export async function interpretMoment(params: {
   track: SpotifyTrack;
   timestamp_s?: number;
+  timestamp_end_s?: number;
   description?: string;
   genres?: string[];
 }): Promise<MomentDescriptor> {
-  const { track, timestamp_s, description, genres } = params;
+  const { track, timestamp_s, timestamp_end_s, description, genres } = params;
 
   if (!timestamp_s && !description) {
     throw new Error("At least one of timestamp_s or description is required");
@@ -107,22 +108,32 @@ export async function interpretMoment(params: {
 
   const artist = track.artists.map((a) => a.name).join(", ");
   const genreStr = genres?.length ? genres.join(", ") : "unknown genre";
+  const durationSec = Math.round(track.duration_ms / 1000);
 
   let userPrompt = `Track: "${track.name}" by ${artist} (${genreStr})`;
   userPrompt += `\nAlbum: ${track.album.name}`;
-  userPrompt += `\nTotal duration: ${Math.round(track.duration_ms / 1000)}s`;
+  userPrompt += `\nTotal duration: ${durationSec}s`;
 
   if (timestamp_s !== undefined) {
-    const minutes = Math.floor(timestamp_s / 60);
-    const seconds = Math.floor(timestamp_s % 60);
-    userPrompt += `\n\nThe user has selected the moment at timestamp ${minutes}:${seconds.toString().padStart(2, "0")}.`;
+    const fmt = (s: number) => {
+      const m = Math.floor(s / 60);
+      const sec = Math.floor(s % 60);
+      return `${m}:${sec.toString().padStart(2, "0")}`;
+    };
+
+    if (timestamp_end_s !== undefined && timestamp_end_s > timestamp_s) {
+      const windowDuration = Math.round(timestamp_end_s - timestamp_s);
+      userPrompt += `\n\nThe user has selected a ${windowDuration}s window from ${fmt(timestamp_s)} to ${fmt(timestamp_end_s)} (${Math.round((timestamp_s / durationSec) * 100)}% into the track).`;
+    } else {
+      userPrompt += `\n\nThe user has selected the moment at timestamp ${fmt(timestamp_s)} (${Math.round((timestamp_s / durationSec) * 100)}% into the track).`;
+    }
   }
 
   if (description) {
     userPrompt += `\n\nThe user describes this moment as: "${description}"`;
   }
 
-  userPrompt += `\n\nAnalyze this musical moment and return the structured JSON descriptor.`;
+  userPrompt += `\n\nInterpret this musical moment and return the structured JSON descriptor.`;
 
   const response = await client.messages.create({
     model: MODEL,
