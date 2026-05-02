@@ -46,6 +46,18 @@ const MatchExplanationSchema = z.object({
   ),
 });
 
+const SuggestMatchesSchema = z.object({
+  suggestions: z
+    .array(
+      z.object({
+        title: z.string(),
+        artist: z.string(),
+        explanation: z.string().max(120),
+      })
+    )
+    .max(8),
+});
+
 // ============================================================
 // Moment interpretation
 // ============================================================
@@ -140,6 +152,72 @@ export async function interpretMoment(params: {
   }
 
   return validated.data;
+}
+
+// ============================================================
+// Claude-based track suggestion (catalog fallback)
+// Used when the pgvector catalog is empty and can't return vector matches.
+// ============================================================
+
+const SUGGEST_SYSTEM_PROMPT = `You are an expert music curator with encyclopedic knowledge of recorded music. Given a description of a specific musical moment's qualities, suggest other real songs that contain a moment with a similar sonic character.
+
+Focus on the specific audio qualities — energy level, textural density, harmonic tension, timbral brightness — not just genre. A sparse, melancholic piano line in a pop song shares more with a sparse jazz ballad than with a dense pop production.
+
+Respond with ONLY valid JSON, no preamble or explanation:
+{
+  "suggestions": [
+    { "title": "<exact song title>", "artist": "<exact artist name>", "explanation": "<one sentence: what moment in this song matches, max 15 words>" },
+    ...
+  ]
+}
+
+Use exact, Spotify-searchable titles and artist names. Suggest 5–7 songs.`;
+
+export async function suggestTrackMatches(params: {
+  descriptor: MomentDescriptor;
+  sourceTrack: { title: string; artist: string };
+  limit?: number;
+}): Promise<Array<{ title: string; artist: string; explanation: string }>> {
+  const { descriptor, sourceTrack, limit = 6 } = params;
+
+  const momentDesc = [
+    `Energy: ${descriptor.energy_profile_label} (${descriptor.energy_profile.toFixed(2)})`,
+    `Timbre: ${descriptor.timbral_character_label}`,
+    `Harmony: ${descriptor.harmonic_tension_label}`,
+    `Structure: ${descriptor.structural_position_label}`,
+    `Texture: ${descriptor.textural_density_label}`,
+    `Emotion: ${descriptor.emotional_arc_label}`,
+    `Context: ${descriptor.reasoning}`,
+  ].join("\n");
+
+  const userPrompt = `Source song: "${sourceTrack.title}" by ${sourceTrack.artist}
+
+This musical moment has these qualities:
+${momentDesc}
+
+Suggest ${limit} other songs (not "${sourceTrack.title}") that contain a moment with a similar sonic character.`;
+
+  const response = await client.messages.create({
+    model: MODEL,
+    max_tokens: 1024,
+    system: SUGGEST_SYSTEM_PROMPT,
+    messages: [{ role: "user", content: userPrompt }],
+  });
+
+  const text = response.content
+    .filter((b) => b.type === "text")
+    .map((b) => (b as { type: "text"; text: string }).text)
+    .join("");
+
+  try {
+    const clean = text.replace(/```json\n?|\n?```/g, "").trim();
+    const parsed = JSON.parse(clean);
+    const validated = SuggestMatchesSchema.safeParse(parsed);
+    if (!validated.success) throw new Error("Schema mismatch");
+    return validated.data.suggestions;
+  } catch {
+    return [];
+  }
 }
 
 // ============================================================

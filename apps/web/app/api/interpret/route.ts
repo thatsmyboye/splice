@@ -4,6 +4,26 @@ import { createClient as createServerClient } from "@/lib/supabase/server";
 import { createClient } from "@supabase/supabase-js";
 import { getTrack } from "@/lib/spotify";
 import { z } from "zod";
+import type { MomentDescriptor } from "@splice/types";
+
+/**
+ * Converts a MomentDescriptor's 6 normalized scores into a 128-dim unit vector
+ * usable for pgvector cosine similarity matching.
+ * Tracks described with similar moment qualities will get similar embeddings.
+ */
+function descriptorToEmbedding(d: MomentDescriptor): number[] {
+  const v = [
+    d.energy_profile,
+    d.timbral_character,
+    d.harmonic_tension,
+    d.structural_position,
+    d.textural_density,
+    d.emotional_arc,
+  ];
+  const e = Array.from({ length: 128 }, (_, i) => v[i % 6]);
+  const mag = Math.sqrt(e.reduce((s, x) => s + x * x, 0));
+  return mag > 0 ? e.map((x) => x / mag) : e;
+}
 
 // Service role client bypasses RLS for transient moment creation
 function getServiceClient() {
@@ -116,6 +136,33 @@ export async function POST(request: NextRequest) {
       { error: "Failed to save moment" },
       { status: 500 }
     );
+  }
+
+  // Store a synthetic embedding derived from the Claude descriptor so this track
+  // is immediately searchable by the vector catalog — even before the Python
+  // analysis service has run. Only inserted when no real analysis exists yet;
+  // on_demand/acousticbrainz entries are left untouched.
+  const { data: existingFeatures } = await serviceSupabase
+    .from("track_features")
+    .select("spotify_id, source")
+    .eq("spotify_id", trackId)
+    .single();
+
+  if (!existingFeatures) {
+    const syntheticEmbedding = descriptorToEmbedding(descriptor);
+    await serviceSupabase.from("track_features").insert({
+      spotify_id: trackId,
+      source: "synthetic",
+      analysis_version: "1.0",
+      segments: null,
+      bpm: null,
+      key_name: null,
+      key_mode: null,
+      danceability: null,
+      dynamic_complexity: null,
+      embedding: syntheticEmbedding,
+      analyzed_at: new Date().toISOString(),
+    });
   }
 
   return NextResponse.json({ descriptor, momentId: moment.id });

@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { explainMatches } from "@/lib/anthropic";
+import { explainMatches, suggestTrackMatches } from "@/lib/anthropic";
 import { getMBRecordings } from "@/lib/musicbrainz";
+import { searchTracks } from "@/lib/spotify";
 import { z } from "zod";
 import type { MomentMatch, MomentDescriptor } from "@splice/types";
 
@@ -17,6 +18,73 @@ const RequestSchema = z.object({
   sourceSpotifyId: z.string().min(1),
   limit: z.number().int().min(1).max(50).default(20),
 });
+
+/**
+ * When the pgvector catalog is empty, ask Claude to suggest real songs and
+ * resolve them to Spotify metadata. Used as a fallback until enough tracks
+ * have been analyzed to produce vector results.
+ */
+async function buildClaudeSuggestions(params: {
+  descriptor: MomentDescriptor;
+  sourceSpotifyId: string;
+  serviceSupabase: ReturnType<typeof getServiceClient>;
+}): Promise<MomentMatch[]> {
+  const { descriptor, sourceSpotifyId, serviceSupabase } = params;
+
+  const { data: sourceTrackData } = await serviceSupabase
+    .from("tracks")
+    .select("title, artist")
+    .eq("spotify_id", sourceSpotifyId)
+    .single();
+
+  if (!sourceTrackData) return [];
+
+  let suggestions: Array<{ title: string; artist: string; explanation: string }>;
+  try {
+    suggestions = await suggestTrackMatches({
+      descriptor,
+      sourceTrack: {
+        title: sourceTrackData.title,
+        artist: sourceTrackData.artist,
+      },
+    });
+  } catch {
+    return [];
+  }
+
+  const matches: MomentMatch[] = [];
+  const seen = new Set<string>();
+
+  for (let i = 0; i < suggestions.length; i++) {
+    const s = suggestions[i];
+    try {
+      const results = await searchTracks(`${s.title} ${s.artist}`, 1);
+      if (results.length === 0) continue;
+      const t = results[0];
+      if (seen.has(t.id) || t.id === sourceSpotifyId) continue;
+      seen.add(t.id);
+
+      // Taper similarity scores: first suggestion = 0.82, each step −0.03
+      const similarity = Math.max(0.5, 0.82 - i * 0.03);
+
+      matches.push({
+        spotify_id: t.id,
+        title: t.name,
+        artist: t.artists.map((a: { name: string }) => a.name).join(", "),
+        artwork_url: t.album?.images?.[0]?.url ?? null,
+        preview_url: t.preview_url ?? null,
+        timestamp_s: 0,
+        similarity_score: similarity,
+        claude_explanation: s.explanation,
+        spotify_embed_url: `https://open.spotify.com/embed/track/${t.id}`,
+      });
+    } catch {
+      // Skip suggestions whose Spotify search fails
+    }
+  }
+
+  return matches;
+}
 
 export async function POST(request: NextRequest) {
   let body: unknown;
@@ -61,6 +129,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Moment not found" }, { status: 404 });
   }
 
+  const descriptor = moment.moment_descriptor as MomentDescriptor;
+
   // Get source track embedding
   const { data: sourceFeatures } = await serviceSupabase
     .from("track_features")
@@ -103,7 +173,31 @@ export async function POST(request: NextRequest) {
   }
 
   if (!rawMatches || rawMatches.length === 0) {
-    return NextResponse.json({ matches: [], cachedAt: null, analysis_pending: false });
+    // Catalog has no matching embeddings yet — ask Claude to suggest similar tracks
+    // and resolve them to real Spotify metadata so the user gets results right away.
+    const matches = await buildClaudeSuggestions({
+      descriptor,
+      sourceSpotifyId,
+      serviceSupabase,
+    });
+
+    if (matches.length > 0) {
+      const expiresAt = new Date(
+        Date.now() + 7 * 24 * 60 * 60 * 1000
+      ).toISOString();
+      await serviceSupabase
+        .from("moment_matches")
+        .upsert(
+          { moment_id: momentId, results: matches, expires_at: expiresAt },
+          { onConflict: "moment_id" }
+        );
+    }
+
+    return NextResponse.json({
+      matches,
+      cachedAt: null,
+      analysis_pending: false,
+    });
   }
 
   // Split results: real Spotify IDs vs AcousticBrainz ("ab:{mbid}") prefixed
@@ -192,7 +286,6 @@ export async function POST(request: NextRequest) {
     .single();
 
   // Claude re-ranking explanations (top 10 only to save tokens)
-  const descriptor = moment.moment_descriptor as MomentDescriptor;
   const matchesForClaude = (rawMatches as Array<{ spotify_id: string; similarity: number }>)
     .filter((m) => trackMap.has(m.spotify_id))
     .slice(0, 10)

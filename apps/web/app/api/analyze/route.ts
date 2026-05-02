@@ -18,10 +18,12 @@ export async function GET(request: NextRequest) {
 
   const serviceSupabase = getServiceClient();
 
+  // Synthetic embeddings are placeholders — only real analysis counts as complete.
   const { data: existing } = await serviceSupabase
     .from("track_features")
-    .select("spotify_id")
+    .select("spotify_id, source")
     .eq("spotify_id", spotifyId)
+    .neq("source", "synthetic")
     .single();
 
   if (existing) {
@@ -64,11 +66,12 @@ export async function POST(request: NextRequest) {
   const { spotifyId, previewUrl } = parsed.data;
   const serviceSupabase = getServiceClient();
 
-  // Already analyzed — nothing to do
+  // Synthetic embeddings are placeholders — only real analysis counts as complete.
   const { data: existing } = await serviceSupabase
     .from("track_features")
-    .select("spotify_id")
+    .select("spotify_id, source")
     .eq("spotify_id", spotifyId)
+    .neq("source", "synthetic")
     .single();
 
   if (existing) {
@@ -97,11 +100,18 @@ export async function POST(request: NextRequest) {
     .select("id")
     .single();
 
-  // Fire Inngest event
-  await inngest.send({
-    name: "analysis/track.requested",
-    data: { spotifyId, previewUrl },
-  });
+  // Fire Inngest event — non-fatal if Inngest is not configured (e.g. missing key).
+  try {
+    await inngest.send({
+      name: "analysis/track.requested",
+      data: { spotifyId, previewUrl },
+    });
+  } catch (err) {
+    console.warn(
+      "[analyze] Inngest send failed — job queued in DB but event not fired:",
+      err instanceof Error ? err.message : err
+    );
+  }
 
   return NextResponse.json({ status: "pending", jobId: job?.id ?? null });
 }
