@@ -129,6 +129,8 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Moment not found" }, { status: 404 });
   }
 
+  const descriptor = moment.moment_descriptor as MomentDescriptor;
+
   // Get source track embedding
   const { data: sourceFeatures } = await serviceSupabase
     .from("track_features")
@@ -284,7 +286,6 @@ export async function POST(request: NextRequest) {
     .single();
 
   // Claude re-ranking explanations (top 10 only to save tokens)
-  const descriptor = moment.moment_descriptor as MomentDescriptor;
   const matchesForClaude = (rawMatches as Array<{ spotify_id: string; similarity: number }>)
     .filter((m) => trackMap.has(m.spotify_id))
     .slice(0, 10)
