@@ -129,7 +129,7 @@ export interface MomentMatch {
   artist: string;
   artwork_url: string | null;
   preview_url: string | null;
-  timestamp_s: number;             // where in the track the matching moment occurs
+  timestamp_s: number | null;      // where in the track the matching moment occurs (null when unknown)
   similarity_score: number;        // 0–1, cosine similarity
   claude_explanation: string;      // one-line human-readable reason for the match
   spotify_embed_url: string;       // https://open.spotify.com/embed/track/{id}
