@@ -318,7 +318,8 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
             {matches.length === 0 ? (
               <p className="text-sm text-muted-foreground py-8 text-center">
-                The catalog is still being indexed. Try analyzing more tracks!
+                No matches found for this moment yet. Try adding a description
+                to sharpen the search.
               </p>
             ) : (
               <div className="space-y-3">

@@ -99,7 +99,7 @@ export interface SegmentFeatures {
 export interface TrackFeatures {
   spotify_id: string;
   mbid: string | null;
-  source: "acousticbrainz" | "on_demand";
+  source: "acousticbrainz" | "on_demand" | "synthetic";
   bpm: number;
   key_name: string;
   key_mode: "major" | "minor";
