@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ArrowLeft, Loader2, Music } from "lucide-react";
+import { TrackTimeline } from "@/components/waveform/TrackTimeline";
 
 type Stage = "select" | "loading" | "analyzing" | "results" | "error";
 
@@ -199,7 +200,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
           </div>
         </div>
 
-        {/* Waveform scrubber */}
+        {/* Waveform scrubber / track timeline */}
         {track.preview_url ? (
           <div className="space-y-2">
             {timestamp !== null && (
@@ -209,8 +210,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
             )}
             {timestamp === null && (
               <p className="text-sm text-muted-foreground">
-                Scrub to a moment and click &ldquo;Mark this moment&rdquo;, or
-                describe it below
+                Scrub to a moment and click &ldquo;Mark this moment&rdquo;
               </p>
             )}
             <WaveformScrubber
@@ -219,8 +219,22 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
             />
           </div>
         ) : (
-          <div className="rounded-xl border border-border bg-secondary/30 p-4 text-sm text-muted-foreground text-center">
-            No 30s preview available for this track. Describe the moment below.
+          <div className="space-y-2">
+            {timestamp !== null && (
+              <p className="text-sm text-primary font-medium">
+                Moment marked at {formatTimestamp(timestamp)}
+              </p>
+            )}
+            {timestamp === null && (
+              <p className="text-sm text-muted-foreground">
+                No audio preview — scrub the timeline to mark where the moment
+                is in the track
+              </p>
+            )}
+            <TrackTimeline
+              durationMs={track.duration_ms}
+              onTimestampSelect={handleTimestampSelect}
+            />
           </div>
         )}
 
@@ -230,7 +244,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && canSubmit && handleFindMoment()}
-            placeholder='Or describe it: "when the bass drops and everything goes quiet..."'
+            placeholder='Describe the moment to sharpen results: "when the bass drops and everything goes quiet..."'
             className="bg-secondary border-border h-11"
           />
           <Button
