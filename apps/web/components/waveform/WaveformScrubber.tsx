@@ -8,8 +8,12 @@ import type { MomentSelection } from "./TrackTimeline";
 const MAX_WINDOW_S = 20;
 
 function fmtTime(s: number) {
-  const m = Math.floor(s / 60);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
   const sec = Math.floor(s % 60);
+  if (h > 0) {
+    return `${h}:${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`;
+  }
   return `${m}:${sec.toString().padStart(2, "0")}`;
 }
 
@@ -32,8 +36,14 @@ function TimeInput({
 
   const parseS = (s: string): number | null => {
     const t = s.trim();
-    const m = t.match(/^(\d{1,2}):(\d{2})$/);
-    if (m) return parseInt(m[1]!) * 60 + parseInt(m[2]!);
+    const hms = t.match(/^(\d+):(\d{1,2}):(\d{2})$/);
+    if (hms) return parseInt(hms[1]!) * 3600 + parseInt(hms[2]!) * 60 + parseInt(hms[3]!);
+    const ms = t.match(/^(\d+):(\d{2})$/);
+    if (ms) return parseInt(ms[1]!) * 60 + parseInt(ms[2]!);
+    if (/^\d+$/.test(t)) {
+      if (t.length <= 2) return parseInt(t);
+      return parseInt(t.slice(0, -2)) * 60 + parseInt(t.slice(-2));
+    }
     const n = parseFloat(t);
     return isNaN(n) ? null : n;
   };
