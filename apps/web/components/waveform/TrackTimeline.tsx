@@ -11,6 +11,69 @@ export interface MomentSelection {
   end_s?: number;
 }
 
+function fmtTime(s: number) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, "0")}`;
+}
+
+function TimeInput({
+  valueSec,
+  onCommit,
+  maxSec,
+  minSec = 0,
+  disabled = false,
+  placeholder = "0:00",
+  className = "",
+}: {
+  valueSec: number | null;
+  onCommit: (s: number) => void;
+  maxSec: number;
+  minSec?: number;
+  disabled?: boolean;
+  placeholder?: string;
+  className?: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const parseS = (s: string): number | null => {
+    const t = s.trim();
+    const m = t.match(/^(\d{1,2}):(\d{2})$/);
+    if (m) return parseInt(m[1]!) * 60 + parseInt(m[2]!);
+    const n = parseFloat(t);
+    return isNaN(n) ? null : n;
+  };
+
+  const commit = () => {
+    if (draft === null) return;
+    const parsed = parseS(draft);
+    if (parsed !== null) {
+      const clamped = Math.max(minSec, Math.min(parsed, maxSec));
+      onCommit(clamped);
+    }
+    setDraft(null);
+  };
+
+  const displayValue = draft !== null ? draft : valueSec !== null ? fmtTime(valueSec) : "";
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={displayValue}
+      disabled={disabled}
+      placeholder={placeholder}
+      className={`w-14 px-1.5 py-0.5 text-xs font-mono tabular-nums rounded bg-background border border-border text-center focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-40 ${className}`}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") setDraft(null);
+      }}
+    />
+  );
+}
+
 interface TrackTimelineProps {
   durationMs: number;
   onMomentSelect: (selection: MomentSelection) => void;
@@ -98,6 +161,32 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
 
   const onUp = useCallback(() => { isDraggingRef.current = false; }, []);
 
+  // ─── manual timestamp handlers ────────────────────────────────────────────
+
+  const handleManualPoint = (seconds: number) => {
+    setPosition(Math.max(0, Math.min(seconds / durationSec, 1)));
+  };
+
+  const handleManualWindowStart = (seconds: number) => {
+    const frac = Math.max(0, Math.min(seconds / durationSec, 1 - 1 / durationSec));
+    setDragAnchor(frac);
+    if (dragCurrent !== null && dragCurrent > frac + 1 / durationSec) {
+      // Preserve existing end, clamped to max window from new start
+      const maxEnd = frac + maxWindowFrac;
+      setDragCurrent(Math.min(dragCurrent, maxEnd, 1));
+    } else {
+      setDragCurrent(frac);
+    }
+  };
+
+  const handleManualWindowEnd = (seconds: number) => {
+    const startFrac = windowStart ?? 0;
+    const endFrac = Math.max(0, Math.min(seconds / durationSec, 1));
+    // Always set anchor = start, current = end so derivations stay correct
+    setDragAnchor(startFrac);
+    setDragCurrent(endFrac);
+  };
+
   // ─── mouse event handlers ──────────────────────────────────────────────────
 
   const handleMouseDown = (e: React.MouseEvent) => onDown(e.clientX);
@@ -141,16 +230,19 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
 
   // ─── display helpers ───────────────────────────────────────────────────────
 
-  const fmt = (s: number) => {
-    const m = Math.floor(s / 60);
-    const sec = Math.floor(s % 60);
-    return `${m}:${sec.toString().padStart(2, "0")}`;
-  };
-
   const anchorLabel = (pos: number) =>
     pos > 0.85 ? "-100%" : "-8px";
 
   const canMark = windowMode ? windowIsValid : position !== null;
+
+  // Computed seconds for inputs
+  const windowStartSec = windowStart !== null ? windowStart * durationSec : null;
+  const windowEndSec = windowEnd !== null ? windowEnd * durationSec : null;
+  const windowEndMaxSec =
+    windowStart !== null
+      ? Math.min(windowStart * durationSec + MAX_WINDOW_S, durationSec)
+      : durationSec;
+  const windowEndMinSec = windowStart !== null ? windowStart * durationSec + 1 : 1;
 
   return (
     <div
@@ -222,7 +314,7 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
               transform: `translateX(${anchorLabel(position)})`,
             }}
           >
-            {fmt(position * durationSec)}
+            {fmtTime(position * durationSec)}
           </div>
         )}
 
@@ -236,7 +328,7 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
                 transform: `translateX(${anchorLabel(windowStart)})`,
               }}
             >
-              {fmt(windowStart * durationSec)}
+              {fmtTime(windowStart * durationSec)}
             </div>
             {windowEnd > windowStart && (
               <div
@@ -246,7 +338,7 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
                   transform: `translateX(${anchorLabel(windowEnd)})`,
                 }}
               >
-                {fmt(windowEnd * durationSec)}
+                {fmtTime(windowEnd * durationSec)}
               </div>
             )}
           </>
@@ -255,17 +347,40 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
 
       {/* Controls */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-        <span className="text-xs text-muted-foreground font-mono tabular-nums">
-          {windowMode
-            ? windowStart !== null && windowEnd !== null
-              ? `${fmt(windowStart * durationSec)} – ${fmt(windowEnd * durationSec)}`
-              : "drag to select"
-            : position !== null
-            ? fmt(position * durationSec)
-            : "–:––"}
-          {" / "}
-          {fmt(durationSec)}
-        </span>
+        {/* Timestamp inputs */}
+        {windowMode ? (
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground font-mono">
+            <TimeInput
+              valueSec={windowStartSec}
+              onCommit={handleManualWindowStart}
+              maxSec={Math.max(0, durationSec - 1)}
+              placeholder="0:00"
+            />
+            <span>—</span>
+            <TimeInput
+              valueSec={windowEndSec}
+              onCommit={handleManualWindowEnd}
+              minSec={windowEndMinSec}
+              maxSec={windowEndMaxSec}
+              disabled={windowStart === null}
+              placeholder="0:00"
+            />
+            <span className="tabular-nums">/ {fmtTime(durationSec)}</span>
+            {windowDurationS > 0 && (
+              <span className="text-muted-foreground/70">({fmtTime(windowDurationS)})</span>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-1.5 text-xs text-muted-foreground font-mono">
+            <TimeInput
+              valueSec={position !== null ? position * durationSec : null}
+              onCommit={handleManualPoint}
+              maxSec={durationSec}
+              placeholder="0:00"
+            />
+            <span className="tabular-nums">/ {fmtTime(durationSec)}</span>
+          </div>
+        )}
 
         <div className="flex items-center gap-2 sm:ml-auto">
           <Button
@@ -294,7 +409,7 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
 
       {windowMode && (
         <p className="text-xs text-muted-foreground">
-          Drag across the timeline to select up to {MAX_WINDOW_S}s of audio for richer matching
+          Drag across the timeline to select up to {MAX_WINDOW_S}s, or type times directly into the inputs
         </p>
       )}
     </div>
