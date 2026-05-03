@@ -169,6 +169,7 @@ export async function POST(request: NextRequest) {
     .single();
 
   if (momentError || !moment) {
+    console.error("[interpret] moments insert failed", momentError);
     return NextResponse.json(
       { error: "Failed to save moment" },
       { status: 500 }
