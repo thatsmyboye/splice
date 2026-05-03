@@ -146,44 +146,46 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
       </div>
 
       {/* Controls */}
-      <div className="flex items-center gap-2">
-        <Button
-          variant="secondary"
-          size="icon"
-          onClick={togglePlay}
-          disabled={!isReady}
-          className="shrink-0 h-8 w-8"
-        >
-          {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
-        </Button>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            size="icon"
+            onClick={togglePlay}
+            disabled={!isReady}
+            className="shrink-0 h-8 w-8"
+          >
+            {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
+          </Button>
 
-        <span className="text-xs text-muted-foreground font-mono tabular-nums shrink-0">
-          {fmt(currentTime)} / {fmt(duration)}
-        </span>
+          <span className="text-xs text-muted-foreground font-mono tabular-nums">
+            {fmt(currentTime)} / {fmt(duration)}
+          </span>
+        </div>
 
-        <div className="flex-1" />
+        <div className="flex items-center gap-2 sm:ml-auto">
+          <Button
+            variant={windowMode ? "secondary" : "ghost"}
+            size="sm"
+            onClick={toggleWindowMode}
+            className="gap-1.5 text-xs px-2"
+            title={windowMode ? "Switch to single point" : "Select a window (max 20s)"}
+          >
+            <GalleryHorizontal className="h-3.5 w-3.5" />
+            Window
+          </Button>
 
-        <Button
-          variant={windowMode ? "secondary" : "ghost"}
-          size="sm"
-          onClick={toggleWindowMode}
-          className="gap-1.5 text-xs px-2"
-          title={windowMode ? "Switch to single point" : "Select a window (max 20s)"}
-        >
-          <GalleryHorizontal className="h-3.5 w-3.5" />
-          Window
-        </Button>
-
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleMark}
-          disabled={!canMark}
-          className="gap-1.5 text-xs"
-        >
-          <Crosshair className="h-3.5 w-3.5" />
-          {windowMode ? "Mark window" : "Mark this moment"}
-        </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleMark}
+            disabled={!canMark}
+            className="gap-1.5 text-xs flex-1 sm:flex-none"
+          >
+            <Crosshair className="h-3.5 w-3.5" />
+            {windowMode ? "Mark window" : "Mark moment"}
+          </Button>
+        </div>
       </div>
 
       {/* Window mode set-start / set-end controls */}

@@ -18,8 +18,8 @@ interface TrackTimelineProps {
 
 export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps) {
   const trackRef = useRef<HTMLDivElement>(null);
+  const isDraggingRef = useRef(false);
   const [windowMode, setWindowMode] = useState(false);
-  const [isDragging, setIsDragging] = useState(false);
 
   // Point mode
   const [position, setPosition] = useState<number | null>(null);
@@ -71,20 +71,20 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
     (clientX: number) => {
       const pos = fractionFromClientX(clientX);
       if (pos === null) return;
+      isDraggingRef.current = true;
       if (windowMode) {
         setDragAnchor(pos);
         setDragCurrent(pos);
       } else {
         setPosition(pos);
       }
-      setIsDragging(true);
     },
     [windowMode, fractionFromClientX]
   );
 
   const onMove = useCallback(
     (clientX: number) => {
-      if (!isDragging) return;
+      if (!isDraggingRef.current) return;
       const pos = fractionFromClientX(clientX);
       if (pos === null) return;
       if (windowMode) {
@@ -93,10 +93,10 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
         setPosition(pos);
       }
     },
-    [isDragging, windowMode, fractionFromClientX]
+    [windowMode, fractionFromClientX]
   );
 
-  const onUp = useCallback(() => setIsDragging(false), []);
+  const onUp = useCallback(() => { isDraggingRef.current = false; }, []);
 
   // ─── mouse event handlers ──────────────────────────────────────────────────
 
@@ -254,8 +254,8 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
       </div>
 
       {/* Controls */}
-      <div className="flex items-center gap-2">
-        <span className="text-xs text-muted-foreground font-mono tabular-nums shrink-0">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <span className="text-xs text-muted-foreground font-mono tabular-nums">
           {windowMode
             ? windowStart !== null && windowEnd !== null
               ? `${fmt(windowStart * durationSec)} – ${fmt(windowEnd * durationSec)}`
@@ -267,29 +267,29 @@ export function TrackTimeline({ durationMs, onMomentSelect }: TrackTimelineProps
           {fmt(durationSec)}
         </span>
 
-        <div className="flex-1" />
+        <div className="flex items-center gap-2 sm:ml-auto">
+          <Button
+            variant={windowMode ? "secondary" : "ghost"}
+            size="sm"
+            onClick={toggleWindowMode}
+            className="gap-1.5 text-xs px-2"
+            title={windowMode ? "Switch to single point" : "Select a window (max 20s)"}
+          >
+            <GalleryHorizontal className="h-3.5 w-3.5" />
+            Window
+          </Button>
 
-        <Button
-          variant={windowMode ? "secondary" : "ghost"}
-          size="sm"
-          onClick={toggleWindowMode}
-          className="gap-1.5 text-xs px-2"
-          title={windowMode ? "Switch to single point" : "Select a window (max 20s)"}
-        >
-          <GalleryHorizontal className="h-3.5 w-3.5" />
-          Window
-        </Button>
-
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={handleMark}
-          disabled={!canMark}
-          className="gap-1.5 text-xs"
-        >
-          <Crosshair className="h-3.5 w-3.5" />
-          {windowMode ? "Mark window" : "Mark this moment"}
-        </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleMark}
+            disabled={!canMark}
+            className="gap-1.5 text-xs flex-1 sm:flex-none"
+          >
+            <Crosshair className="h-3.5 w-3.5" />
+            {windowMode ? "Mark window" : "Mark moment"}
+          </Button>
+        </div>
       </div>
 
       {windowMode && (
