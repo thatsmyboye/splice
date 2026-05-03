@@ -142,7 +142,7 @@ export async function POST(request: NextRequest) {
   // Fetch moment descriptor
   const { data: moment } = await serviceSupabase
     .from("moments")
-    .select("moment_descriptor, timestamp_s")
+    .select("moment_descriptor, timestamp_start_s")
     .eq("id", momentId)
     .single();
 
@@ -188,7 +188,7 @@ export async function POST(request: NextRequest) {
         time_signature: (sourceFeatures.time_signature as 3 | 4 | null) ?? null,
         chord_label: chordAtTimestamp(
           (sourceFeatures.segments ?? []) as Array<{ start_s: number; duration_s: number; chord_label?: string }>,
-          (moment as { timestamp_s?: number | null }).timestamp_s ?? null
+          (moment as { timestamp_start_s?: number | null }).timestamp_start_s ?? null
         ),
       }
     : null;
