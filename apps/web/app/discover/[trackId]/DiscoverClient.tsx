@@ -6,10 +6,11 @@ import Link from "next/link";
 import type { SpotifyTrack, MomentMatch, MomentDescriptor, SourceAnalysis } from "@splice/types";
 import { WaveformScrubber } from "@/components/waveform/WaveformScrubber";
 import { MomentCard } from "@/components/moment-card/MomentCard";
+import { MomentAnalysisPanel } from "@/components/moment-card/MomentAnalysisPanel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ArrowLeft, Loader2, Music } from "lucide-react";
+import { ArrowLeft, Loader2, Music, Scissors } from "lucide-react";
 import { TrackTimeline } from "@/components/waveform/TrackTimeline";
 import type { MomentSelection } from "@/components/waveform/TrackTimeline";
 
@@ -30,7 +31,15 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
   const [matches, setMatches] = useState<MomentMatch[]>([]);
   const [sourceAnalysis, setSourceAnalysis] = useState<SourceAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [deepCutMode, setDeepCutMode] = useState(false);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Spotify popularity ≤ 45 is a rough proxy for tracks with fewer than ~1.5M streams.
+  // AcousticBrainz tracks (popularity === null) are always included — they're inherently obscure.
+  const DEEP_CUT_POPULARITY_MAX = 45;
+  const visibleMatches = deepCutMode
+    ? matches.filter((m) => m.popularity === null || m.popularity <= DEEP_CUT_POPULARITY_MAX)
+    : matches;
 
   const artwork = track.album.images[0]?.url;
   const artist = track.artists.map((a) => a.name).join(", ");
@@ -238,6 +247,24 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
             placeholder='Describe the moment to sharpen results: "when the bass drops and everything goes quiet..."'
             className="bg-secondary border-border h-11"
           />
+
+          {/* Deep Cut toggle */}
+          <button
+            type="button"
+            onClick={() => setDeepCutMode((v) => !v)}
+            className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-sm transition-colors w-full ${
+              deepCutMode
+                ? "bg-primary/10 border-primary/40 text-primary"
+                : "bg-secondary border-border text-muted-foreground hover:text-foreground hover:border-border/80"
+            }`}
+          >
+            <Scissors className={`h-4 w-4 shrink-0 ${deepCutMode ? "text-primary" : ""}`} />
+            <span className="font-medium">Deep Cut mode</span>
+            <span className="ml-auto text-xs opacity-70">
+              {deepCutMode ? "on — hiding mainstream tracks" : "off — show all"}
+            </span>
+          </button>
+
           <Button
             onClick={handleFindMoment}
             disabled={!canSubmit || stage === "loading" || stage === "analyzing"}
@@ -292,52 +319,25 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold">
-                {matches.length > 0
-                  ? `${matches.length} similar moments`
+                {visibleMatches.length > 0
+                  ? `${visibleMatches.length} similar moment${visibleMatches.length === 1 ? "" : "s"}${deepCutMode && visibleMatches.length < matches.length ? ` (${matches.length - visibleMatches.length} hidden by Deep Cut)` : ""}`
                   : "No matches found yet"}
               </h2>
             </div>
 
             {descriptor && (
-              <div className="text-sm text-muted-foreground bg-secondary/50 rounded-lg p-3 border border-border/50">
-                <span className="font-medium text-foreground">Moment interpreted: </span>
-                {descriptor.reasoning}
-              </div>
+              <MomentAnalysisPanel descriptor={descriptor} sourceAnalysis={sourceAnalysis} />
             )}
 
-            {sourceAnalysis && (sourceAnalysis.key_name || sourceAnalysis.bpm || sourceAnalysis.time_signature) && (
-              <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                <span>Source track:</span>
-                {sourceAnalysis.key_name && (
-                  <span className="font-mono bg-secondary px-1.5 py-0.5 rounded">
-                    {sourceAnalysis.key_mode === "minor"
-                      ? `${sourceAnalysis.key_name}m`
-                      : sourceAnalysis.key_name}
-                  </span>
-                )}
-                {sourceAnalysis.time_signature && (
-                  <span className="font-mono bg-secondary px-1.5 py-0.5 rounded">
-                    {sourceAnalysis.time_signature}/4
-                  </span>
-                )}
-                {sourceAnalysis.chord_label && (
-                  <span className="font-mono bg-secondary px-1.5 py-0.5 rounded">
-                    {sourceAnalysis.chord_label}
-                  </span>
-                )}
-                {sourceAnalysis.bpm && (
-                  <span className="font-mono">{Math.round(sourceAnalysis.bpm)} BPM</span>
-                )}
-              </div>
-            )}
-
-            {matches.length === 0 ? (
+            {visibleMatches.length === 0 ? (
               <p className="text-sm text-muted-foreground py-8 text-center">
-                No matches found for this moment yet. Try adding a description to sharpen the search.
+                {deepCutMode && matches.length > 0
+                  ? "All matches were filtered by Deep Cut mode. Try turning it off to see results."
+                  : "No matches found for this moment yet. Try adding a description to sharpen the search."}
               </p>
             ) : (
               <div className="space-y-3">
-                {matches.map((match) => (
+                {visibleMatches.map((match) => (
                   <MomentCard
                     key={`${match.spotify_id}-${match.timestamp_s}`}
                     match={match}

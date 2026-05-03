@@ -83,6 +83,7 @@ async function buildClaudeSuggestions(params: {
         time_signature: null,
         harmonic_rhythm: null,
         chord_label: null,
+        popularity: t.popularity ?? null,
       });
     } catch {
       // Skip suggestions whose Spotify search fails
@@ -273,14 +274,14 @@ export async function POST(request: NextRequest) {
   const { data: spotifyMeta } = spotifyIds.length
     ? await serviceSupabase
         .from("tracks")
-        .select("spotify_id, title, artist, artwork_url, preview_url")
+        .select("spotify_id, title, artist, artwork_url, preview_url, popularity")
         .in("spotify_id", spotifyIds)
     : { data: [] };
 
   const trackMap = new Map(
     (spotifyMeta ?? []).map((t) => [
       t.spotify_id,
-      { title: t.title, artist: t.artist, artwork_url: t.artwork_url, preview_url: t.preview_url },
+      { title: t.title, artist: t.artist, artwork_url: t.artwork_url, preview_url: t.preview_url, popularity: t.popularity ?? null },
     ])
   );
 
@@ -299,6 +300,7 @@ export async function POST(request: NextRequest) {
         artist: row.artist,
         artwork_url: null,
         preview_url: null,
+        popularity: null,
       });
     }
 
@@ -329,6 +331,7 @@ export async function POST(request: NextRequest) {
           artist: info.artist,
           artwork_url: null,
           preview_url: null,
+          popularity: null,
         });
       }
     }
@@ -409,6 +412,7 @@ export async function POST(request: NextRequest) {
         time_signature: (m.time_signature as 3 | 4 | null) ?? null,
         harmonic_rhythm: m.harmonic_rhythm ?? null,
         chord_label: firstSeg?.chord_label ?? null,
+        popularity: t.popularity,
       };
     });
 
