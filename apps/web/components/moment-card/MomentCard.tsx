@@ -22,7 +22,7 @@ export function MomentCard({ match }: MomentCardProps) {
       : null;
   const similarityPct = Math.round(match.similarity_score * 100);
   const keyLabel = formatKey(match.key_name ?? null, match.key_mode ?? null);
-  const hasHarmonicData = keyLabel !== null || match.time_signature !== null || match.bpm !== null;
+  const hasHarmonicData = keyLabel !== null || match.time_signature !== null || match.bpm !== null || !!match.chord_label;
 
   return (
     <div className="bg-card border border-border rounded-lg p-4 flex items-start gap-4 hover:border-border/80 transition-colors">
@@ -76,6 +76,11 @@ export function MomentCard({ match }: MomentCardProps) {
             {match.time_signature && (
               <Badge variant="outline" className="text-xs px-1.5 py-0 font-mono">
                 {match.time_signature}/4
+              </Badge>
+            )}
+            {match.chord_label && (
+              <Badge variant="outline" className="text-xs px-1.5 py-0 font-mono">
+                {match.chord_label}
               </Badge>
             )}
             {match.bpm && (

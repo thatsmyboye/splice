@@ -82,6 +82,7 @@ async function buildClaudeSuggestions(params: {
         key_mode: null,
         time_signature: null,
         harmonic_rhythm: null,
+        chord_label: null,
       });
     } catch {
       // Skip suggestions whose Spotify search fails
@@ -89,6 +90,18 @@ async function buildClaudeSuggestions(params: {
   }
 
   return matches;
+}
+
+function chordAtTimestamp(
+  segments: Array<{ start_s: number; duration_s: number; chord_label?: string }>,
+  timestamp_s: number | null
+): string | null {
+  if (!segments?.length) return null;
+  if (timestamp_s === null) return segments[0]?.chord_label ?? null;
+  const seg =
+    segments.find((s) => timestamp_s >= s.start_s && timestamp_s < s.start_s + s.duration_s) ??
+    segments[0];
+  return seg?.chord_label ?? null;
 }
 
 export async function POST(request: NextRequest) {
@@ -129,7 +142,7 @@ export async function POST(request: NextRequest) {
   // Fetch moment descriptor
   const { data: moment } = await serviceSupabase
     .from("moments")
-    .select("moment_descriptor")
+    .select("moment_descriptor, timestamp_s")
     .eq("id", momentId)
     .single();
 
@@ -142,7 +155,7 @@ export async function POST(request: NextRequest) {
   // Get source track embedding + harmonic context
   const { data: sourceFeatures } = await serviceSupabase
     .from("track_features")
-    .select("embedding, key_name, key_mode, bpm, time_signature, analysis_version")
+    .select("embedding, key_name, key_mode, bpm, time_signature, analysis_version, segments")
     .eq("spotify_id", sourceSpotifyId)
     .single();
 
@@ -173,6 +186,10 @@ export async function POST(request: NextRequest) {
         key_mode: (sourceFeatures.key_mode as "major" | "minor" | null) ?? null,
         bpm: sourceFeatures.bpm ?? null,
         time_signature: (sourceFeatures.time_signature as 3 | 4 | null) ?? null,
+        chord_label: chordAtTimestamp(
+          (sourceFeatures.segments ?? []) as Array<{ start_s: number; duration_s: number; chord_label?: string }>,
+          (moment as { timestamp_s?: number | null }).timestamp_s ?? null
+        ),
       }
     : null;
 
@@ -236,7 +253,7 @@ export async function POST(request: NextRequest) {
     .select("spotify_id, segments")
     .in("spotify_id", matchedIds);
 
-  const segmentsMap = new Map<string, Array<{ start_s: number }>>(
+  const segmentsMap = new Map<string, Array<{ start_s: number; duration_s: number; chord_label?: string }>>(
     (featuresRows ?? []).map((f) => [f.spotify_id, f.segments ?? []])
   );
 
@@ -372,7 +389,7 @@ export async function POST(request: NextRequest) {
     .map((m) => {
       const t = trackMap.get(m.spotify_id)!;
       const segments = segmentsMap.get(m.spotify_id);
-      const firstSegmentStart = segments?.[0]?.start_s ?? null;
+      const firstSeg = segments?.[0];
       const isAB = m.spotify_id.startsWith("ab:");
       return {
         spotify_id: m.spotify_id,
@@ -380,7 +397,7 @@ export async function POST(request: NextRequest) {
         artist: t.artist,
         artwork_url: t.artwork_url,
         preview_url: t.preview_url,
-        timestamp_s: firstSegmentStart,
+        timestamp_s: firstSeg?.start_s ?? null,
         similarity_score: m.similarity,
         claude_explanation: explanations.get(m.spotify_id) ?? "",
         spotify_embed_url: isAB
@@ -391,6 +408,7 @@ export async function POST(request: NextRequest) {
         key_mode: (m.key_mode as "major" | "minor" | null) ?? null,
         time_signature: (m.time_signature as 3 | 4 | null) ?? null,
         harmonic_rhythm: m.harmonic_rhythm ?? null,
+        chord_label: firstSeg?.chord_label ?? null,
       };
     });
 
