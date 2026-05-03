@@ -196,8 +196,13 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  if (!rawMatches || rawMatches.length === 0) {
-    // Catalog has no matching embeddings yet — ask Claude to suggest similar tracks
+  // Synthetic embeddings (created from Claude descriptors) live in a different
+  // vector space than AcousticBrainz embeddings, so cosine similarity between
+  // the two spaces is not meaningful. Fewer than 5 results signals that the
+  // query vector didn't land near the catalog — fall back to Claude suggestions.
+  const MIN_VECTOR_RESULTS = 5;
+  if (!rawMatches || rawMatches.length < MIN_VECTOR_RESULTS) {
+    // Insufficient vector matches — ask Claude to suggest similar tracks
     const matches = await buildClaudeSuggestions({
       descriptor,
       sourceSpotifyId,
