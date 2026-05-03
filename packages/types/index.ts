@@ -147,6 +147,7 @@ export interface MomentMatch {
   key_mode: "major" | "minor" | null;
   time_signature: 3 | 4 | null;
   harmonic_rhythm: number | null;
+  chord_label: string | null;
 }
 
 // ============================================================
@@ -187,6 +188,7 @@ export interface SourceAnalysis {
   key_mode: "major" | "minor" | null;
   bpm: number | null;
   time_signature: 3 | 4 | null;
+  chord_label: string | null;
 }
 
 export interface MatchResponse {

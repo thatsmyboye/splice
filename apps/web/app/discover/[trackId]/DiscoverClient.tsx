@@ -320,6 +320,11 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
                     {sourceAnalysis.time_signature}/4
                   </span>
                 )}
+                {sourceAnalysis.chord_label && (
+                  <span className="font-mono bg-secondary px-1.5 py-0.5 rounded">
+                    {sourceAnalysis.chord_label}
+                  </span>
+                )}
                 {sourceAnalysis.bpm && (
                   <span className="font-mono">{Math.round(sourceAnalysis.bpm)} BPM</span>
                 )}
