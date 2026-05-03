@@ -74,14 +74,13 @@ create table public.track_features (
 create index idx_track_features_spotify_id on public.track_features(spotify_id);
 create index idx_track_features_source on public.track_features(source);
 
--- HNSW index for pgvector cosine similarity search.
--- Preferred over IVFFlat: no training step, works on empty tables,
--- and has better speed-recall tradeoff for typical query volumes.
--- If corpus grows past 1M rows, tune m and ef_construction upward.
+-- IVFFlat index for pgvector similarity search
+-- lists=100 is appropriate for 100K–1M rows
+-- Rebuild with lists=200 if corpus grows past 1M rows
 create index idx_track_features_embedding
   on public.track_features
-  using hnsw (embedding vector_cosine_ops)
-  with (m = 16, ef_construction = 64);
+  using ivfflat (embedding vector_cosine_ops)
+  with (lists = 100);
 
 -- ============================================================
 -- MOMENTS
@@ -117,14 +116,6 @@ create table public.moments (
 create index idx_moments_user_id on public.moments(user_id);
 create index idx_moments_track_id on public.moments(track_id);
 create index idx_moments_public on public.moments(is_public) where is_public = true;
-
--- HNSW index for future moment-to-moment similarity search (Phase 2).
--- Only indexes rows where the embedding has been computed.
-create index idx_moments_descriptor_embedding
-  on public.moments
-  using hnsw (descriptor_embedding vector_cosine_ops)
-  with (m = 16, ef_construction = 64)
-  where descriptor_embedding is not null;
 
 -- ============================================================
 -- MOMENT_MATCHES
