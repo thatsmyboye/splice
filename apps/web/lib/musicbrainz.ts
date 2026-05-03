@@ -1,7 +1,7 @@
 /**
  * MusicBrainz API client.
- * Used to resolve title/artist metadata for AcousticBrainz-indexed tracks
- * (which are stored in track_features with spotify_id = "ab:{mbid}").
+ * Used to resolve title/artist metadata and ISRCs for AcousticBrainz-indexed
+ * tracks (stored in track_features with spotify_id = "ab:{mbid}").
  */
 
 const MB_BASE = "https://musicbrainz.org/ws/2";
@@ -11,11 +11,13 @@ export interface MBTrackInfo {
   mbid: string;
   title: string;
   artist: string;
+  isrc: string | null;
 }
 
 interface MBRecordingResponse {
   id: string;
   title: string;
+  isrcs?: string[];
   "artist-credit"?: Array<{
     name?: string;
     artist: { id: string; name: string };
@@ -25,7 +27,7 @@ interface MBRecordingResponse {
 async function fetchMBRecording(mbid: string): Promise<MBTrackInfo | null> {
   try {
     const res = await fetch(
-      `${MB_BASE}/recording/${encodeURIComponent(mbid)}?inc=artist-credits&fmt=json`,
+      `${MB_BASE}/recording/${encodeURIComponent(mbid)}?inc=artist-credits+isrcs&fmt=json`,
       {
         headers: {
           "User-Agent": MB_USER_AGENT,
@@ -39,7 +41,8 @@ async function fetchMBRecording(mbid: string): Promise<MBTrackInfo | null> {
     const artist =
       credits.map((c) => c.name ?? c.artist.name).join(", ") ||
       "Unknown Artist";
-    return { mbid, title: data.title ?? "Unknown Title", artist };
+    const isrc = data.isrcs?.[0] ?? null;
+    return { mbid, title: data.title ?? "Unknown Title", artist, isrc };
   } catch {
     return null;
   }

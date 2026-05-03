@@ -4,6 +4,7 @@ import type { HarmonicContext } from "@/lib/anthropic";
 import { createClient as createServerClient } from "@/lib/supabase/server";
 import { createClient } from "@supabase/supabase-js";
 import { getTrack } from "@/lib/spotify";
+import { getSongByISRC } from "@/lib/apple-music";
 import { z } from "zod";
 import type { MomentDescriptor } from "@splice/types";
 
@@ -79,9 +80,29 @@ export async function POST(request: NextRequest) {
     }
   }
 
+  // Extract ISRC from Spotify track object (present on /tracks/{id} responses)
+  const isrc: string | null = (track.external_ids?.isrc as string | undefined) ?? null;
+
+  // Enrich with Apple Music: resolve genres and Apple Music catalog ID via ISRC.
+  // This is non-blocking — failures are silently skipped so Spotify-only setups work.
+  let appleMusicId: string | null = null;
+  let genres: string[] | null = null;
+
+  if (isrc) {
+    const amSong = await getSongByISRC(isrc);
+    if (amSong) {
+      appleMusicId = amSong.id;
+      genres = amSong.attributes.genreNames.length > 0
+        ? amSong.attributes.genreNames
+        : null;
+    }
+  }
+
   const serviceSupabase = getServiceClient();
 
-  // Upsert track record so we have a FK for the moment
+  // Upsert track record so we have a FK for the moment.
+  // Store isrc and apple_music_id now so subsequent match lookups can use them
+  // without needing a second Apple Music call.
   const { error: upsertError } = await serviceSupabase
     .from("tracks")
     .upsert(
@@ -96,6 +117,9 @@ export async function POST(request: NextRequest) {
         preview_url: track.preview_url ?? null,
         artwork_url: track.album.images[0]?.url ?? null,
         popularity: track.popularity ?? null,
+        isrc,
+        apple_music_id: appleMusicId,
+        genres,
       },
       { onConflict: "spotify_id" }
     );
@@ -152,10 +176,17 @@ export async function POST(request: NextRequest) {
     // Non-fatal: proceed without harmonic context
   }
 
-  // Claude moment interpretation
+  // Claude moment interpretation — pass Apple Music genres when available
   let descriptor;
   try {
-    descriptor = await interpretMoment({ track, timestamp_s, timestamp_end_s, description, harmonicContext });
+    descriptor = await interpretMoment({
+      track,
+      timestamp_s,
+      timestamp_end_s,
+      description,
+      genres: genres ?? undefined,
+      harmonicContext,
+    });
   } catch (err) {
     return NextResponse.json(
       {
