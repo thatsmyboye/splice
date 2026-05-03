@@ -8,9 +8,22 @@
 -- Without this, the service role client in /api/interpret
 -- cannot INSERT into moments (or SELECT back the inserted id),
 -- causing the "Failed to save moment" error on the UI.
+--
+-- Idempotent: safe to run even if the policy already exists.
 -- ============================================================
 
-create policy "moments_service_all"
-  on public.moments for all to service_role
-  using (true)
-  with check (true);
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename  = 'moments'
+      AND policyname = 'moments_service_all'
+  ) THEN
+    EXECUTE 'CREATE POLICY "moments_service_all"
+      ON public.moments FOR ALL TO service_role
+      USING (true)
+      WITH CHECK (true)';
+  END IF;
+END
+$$;

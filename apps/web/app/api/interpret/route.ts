@@ -82,7 +82,7 @@ export async function POST(request: NextRequest) {
   const serviceSupabase = getServiceClient();
 
   // Upsert track record so we have a FK for the moment
-  await serviceSupabase
+  const { error: upsertError } = await serviceSupabase
     .from("tracks")
     .upsert(
       {
@@ -98,6 +98,18 @@ export async function POST(request: NextRequest) {
       },
       { onConflict: "spotify_id" }
     );
+
+  if (upsertError) {
+    const status = (upsertError as { status?: number }).status ?? 500;
+    if (status >= 500) {
+      console.error("[interpret] tracks upsert failed (service error)", upsertError);
+      return NextResponse.json(
+        { error: "Service temporarily unavailable — please try again" },
+        { status: 503 }
+      );
+    }
+    console.error("[interpret] tracks upsert failed", upsertError);
+  }
 
   const { data: trackRecord } = await serviceSupabase
     .from("tracks")
@@ -169,7 +181,14 @@ export async function POST(request: NextRequest) {
     .single();
 
   if (momentError || !moment) {
+    const status = (momentError as { status?: number } | null)?.status ?? 500;
     console.error("[interpret] moments insert failed", momentError);
+    if (status >= 500) {
+      return NextResponse.json(
+        { error: "Service temporarily unavailable — please try again" },
+        { status: 503 }
+      );
+    }
     return NextResponse.json(
       { error: "Failed to save moment" },
       { status: 500 }
