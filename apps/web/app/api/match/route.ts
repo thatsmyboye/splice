@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { explainMatches, suggestTrackMatches } from "@/lib/anthropic";
 import { getMBRecordings } from "@/lib/musicbrainz";
+import { getSongByISRC } from "@/lib/apple-music";
 import { searchTracks } from "@/lib/spotify";
 import { z } from "zod";
 import type { MomentMatch, MomentDescriptor, SourceAnalysis } from "@splice/types";
@@ -77,6 +78,7 @@ async function buildClaudeSuggestions(params: {
         similarity_score: similarity,
         claude_explanation: s.explanation,
         spotify_embed_url: `https://open.spotify.com/embed/track/${t.id}`,
+        apple_music_url: null,
         bpm: null,
         key_name: null,
         key_mode: null,
@@ -103,6 +105,11 @@ function chordAtTimestamp(
     segments.find((s) => timestamp_s >= s.start_s && timestamp_s < s.start_s + s.duration_s) ??
     segments[0];
   return seg?.chord_label ?? null;
+}
+
+/** Build an Apple Music URL from a catalog ID. */
+function amUrl(appleId: string): string {
+  return `https://music.apple.com/album/${appleId}`;
 }
 
 export async function POST(request: NextRequest) {
@@ -270,26 +277,44 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // Fetch Spotify track metadata from our tracks table
+  // Fetch Spotify track metadata from our tracks table (includes apple_music_id)
   const { data: spotifyMeta } = spotifyIds.length
     ? await serviceSupabase
         .from("tracks")
-        .select("spotify_id, title, artist, artwork_url, preview_url, popularity")
+        .select("spotify_id, title, artist, artwork_url, preview_url, popularity, apple_music_id")
         .in("spotify_id", spotifyIds)
     : { data: [] };
 
-  const trackMap = new Map(
+  type TrackEntry = {
+    title: string;
+    artist: string;
+    artwork_url: string | null;
+    preview_url: string | null;
+    popularity: number | null;
+    apple_music_id: string | null;
+  };
+
+  const trackMap = new Map<string, TrackEntry>(
     (spotifyMeta ?? []).map((t) => [
       t.spotify_id,
-      { title: t.title, artist: t.artist, artwork_url: t.artwork_url, preview_url: t.preview_url, popularity: t.popularity ?? null },
+      {
+        title: t.title,
+        artist: t.artist,
+        artwork_url: t.artwork_url,
+        preview_url: t.preview_url,
+        popularity: t.popularity ?? null,
+        apple_music_id: t.apple_music_id ?? null,
+      },
     ])
   );
 
-  // Resolve AcousticBrainz metadata: check cache first, then MusicBrainz API
+  // Resolve AcousticBrainz metadata: check cache first, then MusicBrainz API.
+  // MusicBrainz now returns ISRCs alongside artist-credits, so we can attempt
+  // Apple Music resolution for newly-fetched AB tracks.
   if (abMbids.length > 0) {
     const { data: cached_mb } = await serviceSupabase
       .from("musicbrainz_cache")
-      .select("mbid, title, artist")
+      .select("mbid, title, artist, isrc, apple_music_id")
       .in("mbid", abMbids);
 
     const cachedMbids = new Set((cached_mb ?? []).map((r) => r.mbid));
@@ -301,6 +326,7 @@ export async function POST(request: NextRequest) {
         artwork_url: null,
         preview_url: null,
         popularity: null,
+        apple_music_id: row.apple_music_id ?? null,
       });
     }
 
@@ -309,10 +335,27 @@ export async function POST(request: NextRequest) {
     if (uncachedMbids.length > 0) {
       const fetched = await getMBRecordings(uncachedMbids);
 
+      // Attempt Apple Music resolution for newly-fetched tracks that have an ISRC.
+      // Runs in parallel, failures are silently skipped.
+      const amLookups = await Promise.allSettled(
+        Array.from(fetched.values()).map(async (info) => {
+          if (!info.isrc) return { mbid: info.mbid, appleId: null };
+          const amSong = await getSongByISRC(info.isrc);
+          return { mbid: info.mbid, appleId: amSong?.id ?? null };
+        })
+      );
+
+      const appleIds = new Map<string, string | null>();
+      amLookups.forEach((r) => {
+        if (r.status === "fulfilled") appleIds.set(r.value.mbid, r.value.appleId);
+      });
+
       const newRows = Array.from(fetched.values()).map((info) => ({
         mbid: info.mbid,
         title: info.title,
         artist: info.artist,
+        isrc: info.isrc ?? null,
+        apple_music_id: appleIds.get(info.mbid) ?? null,
       }));
 
       if (newRows.length > 0) {
@@ -332,6 +375,7 @@ export async function POST(request: NextRequest) {
           artwork_url: null,
           preview_url: null,
           popularity: null,
+          apple_music_id: appleIds.get(mbid) ?? null,
         });
       }
     }
@@ -406,6 +450,7 @@ export async function POST(request: NextRequest) {
         spotify_embed_url: isAB
           ? `https://musicbrainz.org/recording/${m.spotify_id.slice(3)}`
           : `https://open.spotify.com/embed/track/${m.spotify_id}`,
+        apple_music_url: t.apple_music_id ? amUrl(t.apple_music_id) : null,
         bpm: m.bpm ?? null,
         key_name: m.key_name ?? null,
         key_mode: (m.key_mode as "major" | "minor" | null) ?? null,

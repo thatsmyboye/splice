@@ -19,6 +19,7 @@ export interface SpotifyTrack {
   duration_ms: number;
   preview_url: string | null;
   external_urls: { spotify: string };
+  external_ids?: { isrc?: string };
   popularity?: number | null;
 }
 
@@ -33,6 +34,8 @@ export interface Track {
   preview_url: string | null;
   artwork_url: string | null;
   genres: string[] | null;
+  isrc: string | null;
+  apple_music_id: string | null;
 }
 
 // ============================================================
@@ -142,6 +145,7 @@ export interface MomentMatch {
   similarity_score: number;        // 0–1, cosine similarity
   claude_explanation: string;      // one-line human-readable reason for the match
   spotify_embed_url: string;       // https://open.spotify.com/embed/track/{id}
+  apple_music_url: string | null;  // deep link to Apple Music; null when not resolved
   // v2.0 harmonic context — null on v1.0 cached results and Claude-fallback matches
   bpm: number | null;
   key_name: string | null;

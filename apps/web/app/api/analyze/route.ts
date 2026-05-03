@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { inngest } from "@/inngest/client";
+import { getSongByISRC } from "@/lib/apple-music";
 import { z } from "zod";
 
 function getServiceClient() {
@@ -47,7 +48,8 @@ export async function GET(request: NextRequest) {
 
 const RequestSchema = z.object({
   spotifyId: z.string().min(1),
-  previewUrl: z.string().url(),
+  // previewUrl is optional — when absent or null we attempt Apple Music fallback
+  previewUrl: z.string().url().nullable().optional(),
 });
 
 export async function POST(request: NextRequest) {
@@ -63,7 +65,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
-  const { spotifyId, previewUrl } = parsed.data;
+  const { spotifyId } = parsed.data;
+  let previewUrl = parsed.data.previewUrl ?? null;
+
   const serviceSupabase = getServiceClient();
 
   // Synthetic embeddings are placeholders — only real analysis counts as complete.
@@ -76,6 +80,33 @@ export async function POST(request: NextRequest) {
 
   if (existing) {
     return NextResponse.json({ status: "complete", jobId: null });
+  }
+
+  // When Spotify preview URL is absent, attempt Apple Music fallback via ISRC.
+  // ~10-20% of Spotify tracks have null preview_url; Apple Music often has a preview
+  // for the same recording that works with the librosa analysis pipeline.
+  if (!previewUrl) {
+    const { data: trackRow } = await serviceSupabase
+      .from("tracks")
+      .select("isrc")
+      .eq("spotify_id", spotifyId)
+      .single();
+
+    if (trackRow?.isrc) {
+      const amSong = await getSongByISRC(trackRow.isrc);
+      const amPreview = amSong?.attributes.previews?.[0]?.url ?? null;
+      if (amPreview) {
+        previewUrl = amPreview;
+        console.info(`[analyze] Using Apple Music preview for ${spotifyId} (ISRC: ${trackRow.isrc})`);
+      }
+    }
+  }
+
+  if (!previewUrl) {
+    return NextResponse.json(
+      { error: "No preview URL available for this track" },
+      { status: 422 }
+    );
   }
 
   // Already queued
