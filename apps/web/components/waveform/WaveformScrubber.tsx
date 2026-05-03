@@ -7,6 +7,67 @@ import type { MomentSelection } from "./TrackTimeline";
 
 const MAX_WINDOW_S = 20;
 
+function fmtTime(s: number) {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, "0")}`;
+}
+
+function TimeInput({
+  valueSec,
+  onCommit,
+  maxSec,
+  minSec = 0,
+  disabled = false,
+  className = "",
+}: {
+  valueSec: number | null;
+  onCommit: (s: number) => void;
+  maxSec: number;
+  minSec?: number;
+  disabled?: boolean;
+  className?: string;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+
+  const parseS = (s: string): number | null => {
+    const t = s.trim();
+    const m = t.match(/^(\d{1,2}):(\d{2})$/);
+    if (m) return parseInt(m[1]!) * 60 + parseInt(m[2]!);
+    const n = parseFloat(t);
+    return isNaN(n) ? null : n;
+  };
+
+  const commit = () => {
+    if (draft === null) return;
+    const parsed = parseS(draft);
+    if (parsed !== null) {
+      const clamped = Math.max(minSec, Math.min(parsed, maxSec));
+      onCommit(clamped);
+    }
+    setDraft(null);
+  };
+
+  const displayValue = draft !== null ? draft : valueSec !== null ? fmtTime(valueSec) : "";
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={displayValue}
+      disabled={disabled}
+      placeholder="0:00"
+      className={`w-14 px-1.5 py-0.5 text-xs font-mono tabular-nums rounded bg-background border border-border text-center focus:outline-none focus:ring-1 focus:ring-primary disabled:opacity-40 ${className}`}
+      onChange={(e) => setDraft(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") setDraft(null);
+      }}
+    />
+  );
+}
+
 interface WaveformScrubberProps {
   previewUrl: string;
   onMomentSelect: (selection: MomentSelection) => void;
@@ -71,12 +132,29 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
   const setEnd = () => {
     if (windowStart === null) return;
     const raw = currentTime;
-    // End must be after start and within MAX_WINDOW_S
     const clamped = Math.max(
       windowStart + 0.5,
-      Math.min(raw, windowStart + MAX_WINDOW_S)
+      Math.min(raw, windowStart + MAX_WINDOW_S, duration)
     );
     setWindowEnd(clamped);
+  };
+
+  // Manual timestamp handlers
+  const handleSetWindowStart = (t: number) => {
+    const clamped = Math.min(t, duration);
+    setWindowStart(clamped);
+    if (windowEnd !== null) {
+      if (windowEnd <= clamped + 0.5) {
+        setWindowEnd(Math.min(clamped + 0.5, duration));
+      } else if (windowEnd > clamped + MAX_WINDOW_S) {
+        setWindowEnd(Math.min(clamped + MAX_WINDOW_S, duration));
+      }
+    }
+  };
+
+  const handleSetWindowEnd = (t: number) => {
+    if (windowStart === null) return;
+    setWindowEnd(Math.max(windowStart + 0.5, Math.min(t, windowStart + MAX_WINDOW_S, duration)));
   };
 
   const toggleWindowMode = () => {
@@ -96,12 +174,6 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
   };
 
   // ─── display helpers ───────────────────────────────────────────────────────
-
-  const fmt = (s: number) => {
-    const m = Math.floor(s / 60);
-    const sec = Math.floor(s % 60);
-    return `${m}:${sec.toString().padStart(2, "0")}`;
-  };
 
   const windowDurationS =
     windowStart !== null && windowEnd !== null ? windowEnd - windowStart : 0;
@@ -131,13 +203,10 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
             className="absolute top-0 bottom-0 pointer-events-none"
             style={{ left: `${startPct}%`, width: endPct !== null ? `${endPct - startPct}%` : "2px" }}
           >
-            {/* Start marker line */}
             <div className="absolute left-0 top-0 bottom-0 w-0.5 bg-primary" />
-            {/* Fill between markers */}
             {endPct !== null && (
               <div className="absolute inset-0 bg-primary/20" />
             )}
-            {/* End marker line */}
             {endPct !== null && (
               <div className="absolute right-0 top-0 bottom-0 w-0.5 bg-primary/70" />
             )}
@@ -158,9 +227,17 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
             {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
           </Button>
 
-          <span className="text-xs text-muted-foreground font-mono tabular-nums">
-            {fmt(currentTime)} / {fmt(duration)}
-          </span>
+          <div className="flex items-center gap-1 text-xs text-muted-foreground font-mono tabular-nums">
+            <TimeInput
+              valueSec={currentTime}
+              onCommit={(t) => {
+                if (wsRef.current && duration > 0) wsRef.current.seekTo(t / duration);
+              }}
+              maxSec={duration}
+              disabled={!isReady}
+            />
+            <span>/ {fmtTime(duration)}</span>
+          </div>
         </div>
 
         <div className="flex items-center gap-2 sm:ml-auto">
@@ -190,33 +267,57 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
 
       {/* Window mode set-start / set-end controls */}
       {windowMode && (
-        <div className="flex items-center gap-2 pt-1 border-t border-border/40">
+        <div className="flex flex-wrap items-center gap-2 pt-1 border-t border-border/40">
           <Button
-            variant={windowStart !== null ? "secondary" : "outline"}
+            variant="outline"
             size="sm"
             onClick={setStart}
             disabled={!isReady}
-            className="text-xs flex-1"
+            className="text-xs shrink-0"
           >
-            {windowStart !== null ? `Start: ${fmt(windowStart)}` : "Set start"}
+            Start
           </Button>
+          <TimeInput
+            valueSec={windowStart}
+            onCommit={handleSetWindowStart}
+            maxSec={windowEnd !== null ? Math.max(0, windowEnd - 0.5) : Math.max(0, duration - 0.5)}
+            disabled={!isReady}
+          />
+
+          <span className="text-muted-foreground text-xs">—</span>
+
           <Button
-            variant={windowEnd !== null ? "secondary" : "outline"}
+            variant="outline"
             size="sm"
             onClick={setEnd}
             disabled={!isReady || windowStart === null}
-            className="text-xs flex-1"
+            className="text-xs shrink-0"
           >
-            {windowEnd !== null
-              ? `End: ${fmt(windowEnd)} (${fmt(windowDurationS)})`
-              : "Set end"}
+            End
           </Button>
+          <TimeInput
+            valueSec={windowEnd}
+            onCommit={handleSetWindowEnd}
+            minSec={windowStart !== null ? windowStart + 0.5 : 0}
+            maxSec={
+              windowStart !== null
+                ? Math.min(windowStart + MAX_WINDOW_S, duration)
+                : duration
+            }
+            disabled={!isReady || windowStart === null}
+          />
+
+          {windowDurationS > 0 && (
+            <span className="text-xs text-muted-foreground font-mono tabular-nums ml-auto">
+              {fmtTime(windowDurationS)}
+            </span>
+          )}
         </div>
       )}
 
       {windowMode && (
         <p className="text-xs text-muted-foreground">
-          Play to your moment, set the start, continue playing, then set the end (max {MAX_WINDOW_S}s)
+          Play to your moment and use the Start/End buttons, or type times directly (max {MAX_WINDOW_S}s)
         </p>
       )}
     </div>
