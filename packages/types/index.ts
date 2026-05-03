@@ -94,19 +94,27 @@ export interface SegmentFeatures {
   spectral_centroid: number;
   chroma_vector: number[];          // 12-dim
   mfcc_means: number[];             // 13-dim
+  // v2.0 fields — absent on rows analyzed with v1.0
+  chord_label?: string;             // e.g. 'Am', 'F#', 'N' (no chord / silence)
+  chord_confidence?: number;        // 0.0–1.0, template match score
 }
 
 export interface TrackFeatures {
   spotify_id: string;
   mbid: string | null;
   source: "acousticbrainz" | "on_demand" | "synthetic";
+  analysis_version: string;
   bpm: number;
   key_name: string;
   key_mode: "major" | "minor";
   danceability: number;
   dynamic_complexity: number;
+  // v2.0 fields — null on v1.0 rows
+  key_confidence: number | null;
+  time_signature: 3 | 4 | null;
+  harmonic_rhythm: number | null;
   segments: SegmentFeatures[];
-  embedding: number[];              // 128-dim
+  embedding: number[];              // 128-dim (v2 layout when analysis_version='2.0')
 }
 
 export type AnalysisStatus = "pending" | "processing" | "complete" | "failed";
@@ -133,6 +141,12 @@ export interface MomentMatch {
   similarity_score: number;        // 0–1, cosine similarity
   claude_explanation: string;      // one-line human-readable reason for the match
   spotify_embed_url: string;       // https://open.spotify.com/embed/track/{id}
+  // v2.0 harmonic context — null on v1.0 cached results and Claude-fallback matches
+  bpm: number | null;
+  key_name: string | null;
+  key_mode: "major" | "minor" | null;
+  time_signature: 3 | 4 | null;
+  harmonic_rhythm: number | null;
 }
 
 // ============================================================
@@ -167,10 +181,20 @@ export interface MatchRequest {
   limit?: number;                  // default 20
 }
 
+/** Harmonic summary of the source track, returned alongside match results. */
+export interface SourceAnalysis {
+  key_name: string | null;
+  key_mode: "major" | "minor" | null;
+  bpm: number | null;
+  time_signature: 3 | 4 | null;
+}
+
 export interface MatchResponse {
   matches: MomentMatch[];
   cachedAt: string | null;
   /** True when the source track's audio analysis is still in progress.
    *  The client should poll /api/analyze?spotifyId={id} and retry once complete. */
   analysis_pending: boolean;
+  /** Harmonic context for the source track (null when no v2 analysis exists). */
+  source_analysis: SourceAnalysis | null;
 }

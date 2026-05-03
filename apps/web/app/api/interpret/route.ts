@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { interpretMoment } from "@/lib/anthropic";
+import type { HarmonicContext } from "@/lib/anthropic";
 import { createClient as createServerClient } from "@/lib/supabase/server";
 import { createClient } from "@supabase/supabase-js";
 import { getTrack } from "@/lib/spotify";
@@ -104,10 +105,44 @@ export async function POST(request: NextRequest) {
     .eq("spotify_id", trackId)
     .single();
 
+  // Fetch harmonic context from existing v2.0 analysis (non-blocking, skip on error)
+  let harmonicContext: HarmonicContext | undefined;
+  try {
+    const { data: existingAnalysis } = await serviceSupabase
+      .from("track_features")
+      .select("key_name, key_mode, key_confidence, time_signature, harmonic_rhythm, segments, analysis_version")
+      .eq("spotify_id", trackId)
+      .neq("source", "synthetic")
+      .single();
+
+    if (existingAnalysis?.analysis_version === "2.0" && existingAnalysis.key_name) {
+      type SegRow = { start_s: number; chord_label?: string; chord_confidence?: number };
+      const segs = (existingAnalysis.segments ?? []) as SegRow[];
+      let segChord: string | undefined;
+      let segChordConf: number | undefined;
+      if (timestamp_s !== undefined) {
+        const matchSeg = segs.filter((s) => s.start_s <= timestamp_s).pop();
+        segChord = matchSeg?.chord_label;
+        segChordConf = matchSeg?.chord_confidence;
+      }
+      harmonicContext = {
+        key_name: existingAnalysis.key_name,
+        key_mode: existingAnalysis.key_mode,
+        key_confidence: existingAnalysis.key_confidence ?? 0.5,
+        time_signature: existingAnalysis.time_signature ?? null,
+        harmonic_rhythm: existingAnalysis.harmonic_rhythm ?? null,
+        segment_chord: segChord,
+        segment_chord_confidence: segChordConf,
+      };
+    }
+  } catch {
+    // Non-fatal: proceed without harmonic context
+  }
+
   // Claude moment interpretation
   let descriptor;
   try {
-    descriptor = await interpretMoment({ track, timestamp_s, timestamp_end_s, description });
+    descriptor = await interpretMoment({ track, timestamp_s, timestamp_end_s, description, harmonicContext });
   } catch (err) {
     return NextResponse.json(
       {

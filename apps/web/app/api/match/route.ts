@@ -4,7 +4,7 @@ import { explainMatches, suggestTrackMatches } from "@/lib/anthropic";
 import { getMBRecordings } from "@/lib/musicbrainz";
 import { searchTracks } from "@/lib/spotify";
 import { z } from "zod";
-import type { MomentMatch, MomentDescriptor } from "@splice/types";
+import type { MomentMatch, MomentDescriptor, SourceAnalysis } from "@splice/types";
 
 function getServiceClient() {
   return createClient(
@@ -77,6 +77,11 @@ async function buildClaudeSuggestions(params: {
         similarity_score: similarity,
         claude_explanation: s.explanation,
         spotify_embed_url: `https://open.spotify.com/embed/track/${t.id}`,
+        bpm: null,
+        key_name: null,
+        key_mode: null,
+        time_signature: null,
+        harmonic_rhythm: null,
       });
     } catch {
       // Skip suggestions whose Spotify search fails
@@ -117,6 +122,7 @@ export async function POST(request: NextRequest) {
       matches: cached.results,
       cachedAt: cached.created_at,
       analysis_pending: false,
+      source_analysis: null,
     });
   }
 
@@ -133,10 +139,10 @@ export async function POST(request: NextRequest) {
 
   const descriptor = moment.moment_descriptor as MomentDescriptor;
 
-  // Get source track embedding
+  // Get source track embedding + harmonic context
   const { data: sourceFeatures } = await serviceSupabase
     .from("track_features")
-    .select("embedding")
+    .select("embedding, key_name, key_mode, bpm, time_signature, analysis_version")
     .eq("spotify_id", sourceSpotifyId)
     .single();
 
@@ -154,16 +160,32 @@ export async function POST(request: NextRequest) {
       matches: [],
       cachedAt: null,
       analysis_pending: !!job,
+      source_analysis: null,
     });
   }
 
-  // pgvector similarity search via RPC
+  const isV2 = sourceFeatures.analysis_version === "2.0";
+
+  // Build source_analysis for the frontend harmonic header
+  const source_analysis: SourceAnalysis | null = isV2
+    ? {
+        key_name: sourceFeatures.key_name ?? null,
+        key_mode: (sourceFeatures.key_mode as "major" | "minor" | null) ?? null,
+        bpm: sourceFeatures.bpm ?? null,
+        time_signature: (sourceFeatures.time_signature as 3 | 4 | null) ?? null,
+      }
+    : null;
+
+  // pgvector similarity search via RPC (with optional COF key boosting for v2)
   const { data: rawMatches, error: matchError } = await serviceSupabase.rpc(
     "match_tracks",
     {
       query_embedding: sourceFeatures.embedding,
       match_count: limit,
       exclude_spotify_id: sourceSpotifyId,
+      source_key_name: isV2 ? (sourceFeatures.key_name ?? null) : null,
+      source_key_mode: isV2 ? (sourceFeatures.key_mode ?? null) : null,
+      key_boost_weight: isV2 ? 0.08 : 0.0,
     }
   );
 
@@ -176,7 +198,6 @@ export async function POST(request: NextRequest) {
 
   if (!rawMatches || rawMatches.length === 0) {
     // Catalog has no matching embeddings yet — ask Claude to suggest similar tracks
-    // and resolve them to real Spotify metadata so the user gets results right away.
     const matches = await buildClaudeSuggestions({
       descriptor,
       sourceSpotifyId,
@@ -199,6 +220,7 @@ export async function POST(request: NextRequest) {
       matches,
       cachedAt: null,
       analysis_pending: false,
+      source_analysis,
     });
   }
 
@@ -219,7 +241,7 @@ export async function POST(request: NextRequest) {
 
   for (const m of rawMatches as Array<{ spotify_id: string }>) {
     if (m.spotify_id.startsWith("ab:")) {
-      abMbids.push(m.spotify_id.slice(3)); // strip "ab:" prefix
+      abMbids.push(m.spotify_id.slice(3));
     } else {
       spotifyIds.push(m.spotify_id);
     }
@@ -270,13 +292,12 @@ export async function POST(request: NextRequest) {
       }));
 
       if (newRows.length > 0) {
-        // Cache for future requests — ignore errors
         try {
           await serviceSupabase
             .from("musicbrainz_cache")
             .upsert(newRows, { onConflict: "mbid" });
         } catch {
-          // Non-fatal: cache miss on next request will re-fetch
+          // Non-fatal
         }
       }
 
@@ -298,8 +319,18 @@ export async function POST(request: NextRequest) {
     .eq("spotify_id", sourceSpotifyId)
     .single();
 
+  type RawMatch = {
+    spotify_id: string;
+    similarity: number;
+    bpm: number | null;
+    key_name: string | null;
+    key_mode: string | null;
+    time_signature: number | null;
+    harmonic_rhythm: number | null;
+  };
+
   // Claude re-ranking explanations (top 10 only to save tokens)
-  const matchesForClaude = (rawMatches as Array<{ spotify_id: string; similarity: number }>)
+  const matchesForClaude = (rawMatches as RawMatch[])
     .filter((m) => trackMap.has(m.spotify_id))
     .slice(0, 10)
     .map((m) => {
@@ -309,6 +340,8 @@ export async function POST(request: NextRequest) {
         title: t.title,
         artist: t.artist,
         similarity_score: m.similarity,
+        key_name: m.key_name,
+        key_mode: m.key_mode,
       };
     });
 
@@ -329,9 +362,7 @@ export async function POST(request: NextRequest) {
   }
 
   // Build final results — include both Spotify and AcousticBrainz tracks
-  const matches: MomentMatch[] = (
-    rawMatches as Array<{ spotify_id: string; similarity: number }>
-  )
+  const matches: MomentMatch[] = (rawMatches as RawMatch[])
     .filter((m) => trackMap.has(m.spotify_id))
     .map((m) => {
       const t = trackMap.get(m.spotify_id)!;
@@ -347,10 +378,14 @@ export async function POST(request: NextRequest) {
         timestamp_s: firstSegmentStart,
         similarity_score: m.similarity,
         claude_explanation: explanations.get(m.spotify_id) ?? "",
-        // AcousticBrainz tracks link to MusicBrainz instead of Spotify
         spotify_embed_url: isAB
           ? `https://musicbrainz.org/recording/${m.spotify_id.slice(3)}`
           : `https://open.spotify.com/embed/track/${m.spotify_id}`,
+        bpm: m.bpm ?? null,
+        key_name: m.key_name ?? null,
+        key_mode: (m.key_mode as "major" | "minor" | null) ?? null,
+        time_signature: (m.time_signature as 3 | 4 | null) ?? null,
+        harmonic_rhythm: m.harmonic_rhythm ?? null,
       };
     });
 
@@ -363,5 +398,5 @@ export async function POST(request: NextRequest) {
       { onConflict: "moment_id,source_spotify_id" }
     );
 
-  return NextResponse.json({ matches, cachedAt: null, analysis_pending: false });
+  return NextResponse.json({ matches, cachedAt: null, analysis_pending: false, source_analysis });
 }
