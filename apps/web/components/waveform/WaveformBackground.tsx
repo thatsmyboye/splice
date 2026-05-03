@@ -9,8 +9,7 @@ export function WaveformBackground() {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    const ctx = canvas.getContext("2d") as CanvasRenderingContext2D;
 
     let W = 0;
     let H = 0;
@@ -25,11 +24,10 @@ export function WaveformBackground() {
       H = canvas.offsetHeight;
       canvas.width = W * dpr;
       canvas.height = H * dpr;
-      ctx!.scale(dpr, dpr);
+      ctx.scale(dpr, dpr);
     }
 
     function draw() {
-      if (!ctx) return;
       t += 0.004;
 
       ctx.clearRect(0, 0, W, H);
