@@ -95,6 +95,7 @@ export async function POST(request: NextRequest) {
         duration_ms: track.duration_ms,
         preview_url: track.preview_url ?? null,
         artwork_url: track.album.images[0]?.url ?? null,
+        popularity: track.popularity ?? null,
       },
       { onConflict: "spotify_id" }
     );

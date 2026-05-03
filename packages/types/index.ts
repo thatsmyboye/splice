@@ -19,6 +19,7 @@ export interface SpotifyTrack {
   duration_ms: number;
   preview_url: string | null;
   external_urls: { spotify: string };
+  popularity?: number | null;
 }
 
 export interface Track {
@@ -148,6 +149,7 @@ export interface MomentMatch {
   time_signature: 3 | 4 | null;
   harmonic_rhythm: number | null;
   chord_label: string | null;
+  popularity: number | null;       // Spotify popularity 0–100; null for AcousticBrainz tracks
 }
 
 // ============================================================
