@@ -91,7 +91,19 @@ Scale definitions:
 - textural_density: 0 = solo instrument/single voice, 1 = full ensemble/wall of sound
 - emotional_arc: 0 = descending/grief/resignation, 1 = ascending/release/triumph
 
-Be precise and consistent. A high-energy EDM drop and a loud orchestral climax may both score 0.9 on energy_profile, but differ significantly on timbral_character and structural_position. Base your interpretation on the track metadata, the timestamp's position within the track structure, and any description provided — write the reasoning as a confident characterization, not a guess.`;
+Be precise and consistent. A high-energy EDM drop and a loud orchestral climax may both score 0.9 on energy_profile, but differ significantly on timbral_character and structural_position. Base your interpretation on the track metadata, the timestamp's position within the track structure, and any description provided — write the reasoning as a confident characterization, not a guess.
+
+When audio analysis data is provided (key, time signature, chord), incorporate those facts into your harmonic_tension score and reasoning. A suspension or tritone chord raises harmonic_tension; a resolved tonic chord lowers it. Do not contradict the provided key unless the description strongly implies otherwise.`;
+
+export interface HarmonicContext {
+  key_name: string;
+  key_mode: string;
+  key_confidence: number;
+  time_signature: number | null;
+  harmonic_rhythm: number | null;
+  segment_chord?: string;
+  segment_chord_confidence?: number;
+}
 
 export async function interpretMoment(params: {
   track: SpotifyTrack;
@@ -99,8 +111,9 @@ export async function interpretMoment(params: {
   timestamp_end_s?: number;
   description?: string;
   genres?: string[];
+  harmonicContext?: HarmonicContext;
 }): Promise<MomentDescriptor> {
-  const { track, timestamp_s, timestamp_end_s, description, genres } = params;
+  const { track, timestamp_s, timestamp_end_s, description, genres, harmonicContext } = params;
 
   if (!timestamp_s && !description) {
     throw new Error("At least one of timestamp_s or description is required");
@@ -131,6 +144,33 @@ export async function interpretMoment(params: {
 
   if (description) {
     userPrompt += `\n\nThe user describes this moment as: "${description}"`;
+  }
+
+  if (harmonicContext) {
+    const hc = harmonicContext;
+    const confPct = Math.round(hc.key_confidence * 100);
+    let harmonicLine = `\n\nAudio analysis reveals: key is ${hc.key_name} ${hc.key_mode} (${confPct}% confidence)`;
+    if (hc.time_signature) {
+      harmonicLine += `, time signature is ${hc.time_signature}/4`;
+    }
+    if (hc.harmonic_rhythm !== null) {
+      const rhythmLabel =
+        hc.harmonic_rhythm < 0.3
+          ? "slow-moving harmony"
+          : hc.harmonic_rhythm < 0.6
+            ? "moderate harmonic rhythm"
+            : "fast-changing harmony";
+      harmonicLine += `, ${rhythmLabel}`;
+    }
+    if (
+      hc.segment_chord &&
+      hc.segment_chord !== "N" &&
+      (hc.segment_chord_confidence ?? 0) > 0.5
+    ) {
+      harmonicLine += `. At this moment, the predominant chord is ${hc.segment_chord} (confidence ${Math.round((hc.segment_chord_confidence ?? 0) * 100)}%)`;
+    }
+    harmonicLine += ".";
+    userPrompt += harmonicLine;
   }
 
   userPrompt += `\n\nInterpret this musical moment and return the structured JSON descriptor.`;
@@ -253,6 +293,8 @@ export async function explainMatches(params: {
     title: string;
     artist: string;
     similarity_score: number;
+    key_name?: string | null;
+    key_mode?: string | null;
   }>;
 }): Promise<Map<string, string>> {
   const { sourceMomentDescriptor: descriptor, sourceTrack, matches } = params;
@@ -267,10 +309,11 @@ export async function explainMatches(params: {
   ].join(" ");
 
   const matchList = matches
-    .map(
-      (m) =>
-        `- spotify_id: ${m.spotify_id}, title: "${m.title}", artist: ${m.artist}`
-    )
+    .map((m) => {
+      const keyInfo =
+        m.key_name ? `, key: ${m.key_name} ${m.key_mode ?? ""}`.trim() : "";
+      return `- spotify_id: ${m.spotify_id}, title: "${m.title}", artist: ${m.artist}${keyInfo}`;
+    })
     .join("\n");
 
   const userPrompt = `Source moment:\n${sourceDesc}\n\nMatched songs:\n${matchList}\n\nExplain why each matched song shares a similar moment.`;

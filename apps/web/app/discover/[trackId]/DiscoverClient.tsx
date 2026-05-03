@@ -3,7 +3,7 @@
 import { useState, useCallback, useRef } from "react";
 import Image from "next/image";
 import Link from "next/link";
-import type { SpotifyTrack, MomentMatch, MomentDescriptor } from "@splice/types";
+import type { SpotifyTrack, MomentMatch, MomentDescriptor, SourceAnalysis } from "@splice/types";
 import { WaveformScrubber } from "@/components/waveform/WaveformScrubber";
 import { MomentCard } from "@/components/moment-card/MomentCard";
 import { Button } from "@/components/ui/button";
@@ -28,6 +28,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
   const [description, setDescription] = useState("");
   const [descriptor, setDescriptor] = useState<MomentDescriptor | null>(null);
   const [matches, setMatches] = useState<MomentMatch[]>([]);
+  const [sourceAnalysis, setSourceAnalysis] = useState<SourceAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -58,11 +59,12 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
       throw new Error(err.error ?? "Matching failed");
     }
 
-    const { matches: m, analysis_pending } = await matchRes.json();
+    const { matches: m, analysis_pending, source_analysis } = await matchRes.json();
 
     if (analysis_pending) return { done: false, pending: true };
 
     setMatches(m);
+    if (source_analysis) setSourceAnalysis(source_analysis);
     setStage("results");
     return { done: true, pending: false };
   };
@@ -103,6 +105,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
     setStage("loading");
     setError(null);
     setMatches([]);
+    setSourceAnalysis(null);
 
     try {
       const interpretRes = await fetch("/api/interpret", {
@@ -299,6 +302,27 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
               <div className="text-sm text-muted-foreground bg-secondary/50 rounded-lg p-3 border border-border/50">
                 <span className="font-medium text-foreground">Moment interpreted: </span>
                 {descriptor.reasoning}
+              </div>
+            )}
+
+            {sourceAnalysis && (sourceAnalysis.key_name || sourceAnalysis.bpm || sourceAnalysis.time_signature) && (
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <span>Source track:</span>
+                {sourceAnalysis.key_name && (
+                  <span className="font-mono bg-secondary px-1.5 py-0.5 rounded">
+                    {sourceAnalysis.key_mode === "minor"
+                      ? `${sourceAnalysis.key_name}m`
+                      : sourceAnalysis.key_name}
+                  </span>
+                )}
+                {sourceAnalysis.time_signature && (
+                  <span className="font-mono bg-secondary px-1.5 py-0.5 rounded">
+                    {sourceAnalysis.time_signature}/4
+                  </span>
+                )}
+                {sourceAnalysis.bpm && (
+                  <span className="font-mono">{Math.round(sourceAnalysis.bpm)} BPM</span>
+                )}
               </div>
             )}
 

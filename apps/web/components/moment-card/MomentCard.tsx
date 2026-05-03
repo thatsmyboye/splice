@@ -7,12 +7,22 @@ interface MomentCardProps {
   match: MomentMatch;
 }
 
+function formatKey(
+  keyName: string | null,
+  keyMode: "major" | "minor" | null
+): string | null {
+  if (!keyName) return null;
+  return keyMode === "minor" ? `${keyName}m` : keyName;
+}
+
 export function MomentCard({ match }: MomentCardProps) {
   const timeStr =
     match.timestamp_s !== null
       ? `${Math.floor(match.timestamp_s / 60)}:${Math.floor(match.timestamp_s % 60).toString().padStart(2, "0")}`
       : null;
   const similarityPct = Math.round(match.similarity_score * 100);
+  const keyLabel = formatKey(match.key_name ?? null, match.key_mode ?? null);
+  const hasHarmonicData = keyLabel !== null || match.time_signature !== null || match.bpm !== null;
 
   return (
     <div className="bg-card border border-border rounded-lg p-4 flex items-start gap-4 hover:border-border/80 transition-colors">
@@ -54,6 +64,26 @@ export function MomentCard({ match }: MomentCardProps) {
           <p className="text-sm text-muted-foreground/80 italic leading-snug">
             &ldquo;{match.claude_explanation}&rdquo;
           </p>
+        )}
+
+        {hasHarmonicData && (
+          <div className="flex flex-wrap gap-1.5 pt-0.5">
+            {keyLabel && (
+              <Badge variant="outline" className="text-xs px-1.5 py-0 font-mono">
+                {keyLabel}
+              </Badge>
+            )}
+            {match.time_signature && (
+              <Badge variant="outline" className="text-xs px-1.5 py-0 font-mono">
+                {match.time_signature}/4
+              </Badge>
+            )}
+            {match.bpm && (
+              <span className="text-xs text-muted-foreground font-mono self-center">
+                {Math.round(match.bpm)} BPM
+              </span>
+            )}
+          </div>
         )}
       </div>
 
