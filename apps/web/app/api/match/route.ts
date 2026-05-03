@@ -102,11 +102,13 @@ export async function POST(request: NextRequest) {
   const { momentId, sourceSpotifyId, limit } = parsed.data;
   const serviceSupabase = getServiceClient();
 
-  // Check cache
+  // Check cache — key is (moment_id, source_spotify_id) so results are
+  // never shared across different source tracks.
   const { data: cached } = await serviceSupabase
     .from("moment_matches")
     .select("results, created_at")
     .eq("moment_id", momentId)
+    .eq("source_spotify_id", sourceSpotifyId)
     .gt("expires_at", new Date().toISOString())
     .single();
 
@@ -188,8 +190,8 @@ export async function POST(request: NextRequest) {
       await serviceSupabase
         .from("moment_matches")
         .upsert(
-          { moment_id: momentId, results: matches, expires_at: expiresAt },
-          { onConflict: "moment_id" }
+          { moment_id: momentId, source_spotify_id: sourceSpotifyId, results: matches, expires_at: expiresAt },
+          { onConflict: "moment_id,source_spotify_id" }
         );
     }
 
@@ -357,8 +359,8 @@ export async function POST(request: NextRequest) {
   await serviceSupabase
     .from("moment_matches")
     .upsert(
-      { moment_id: momentId, results: matches, expires_at: expiresAt },
-      { onConflict: "moment_id" }
+      { moment_id: momentId, source_spotify_id: sourceSpotifyId, results: matches, expires_at: expiresAt },
+      { onConflict: "moment_id,source_spotify_id" }
     );
 
   return NextResponse.json({ matches, cachedAt: null, analysis_pending: false });
