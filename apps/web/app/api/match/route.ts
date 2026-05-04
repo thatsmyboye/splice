@@ -40,7 +40,7 @@ async function buildClaudeSuggestions(params: {
 
   if (!sourceTrackData) return [];
 
-  let suggestions: Array<{ title: string; artist: string; explanation: string }>;
+  let suggestions: Array<{ title: string; artist: string; explanation: string; similarity_score: number }>;
   try {
     suggestions = await suggestTrackMatches({
       descriptor,
