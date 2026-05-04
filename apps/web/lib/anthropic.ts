@@ -53,6 +53,7 @@ const SuggestMatchesSchema = z.object({
         title: z.string(),
         artist: z.string(),
         explanation: z.string().max(120),
+        similarity_score: z.number().min(0).max(1),
       })
     )
     .max(8),
@@ -214,10 +215,12 @@ const SUGGEST_SYSTEM_PROMPT = `You are an expert music curator with encyclopedic
 
 Focus on the specific audio qualities — energy level, textural density, harmonic tension, timbral brightness — not just genre. A sparse, melancholic piano line in a pop song shares more with a sparse jazz ballad than with a dense pop production.
 
+For each suggestion, assign a similarity_score (0.0–1.0) reflecting how closely the suggested moment matches the source moment's audio qualities. Vary scores meaningfully: a near-perfect match should score 0.88–0.95, a strong match 0.70–0.87, a moderate match 0.55–0.69. Do not assign the same score to multiple suggestions.
+
 Respond with ONLY valid JSON, no preamble or explanation:
 {
   "suggestions": [
-    { "title": "<exact song title>", "artist": "<exact artist name>", "explanation": "<one sentence: what moment in this song matches, max 15 words>" },
+    { "title": "<exact song title>", "artist": "<exact artist name>", "explanation": "<one sentence: what moment in this song matches, max 15 words>", "similarity_score": <float 0.0–1.0> },
     ...
   ]
 }
@@ -228,7 +231,7 @@ export async function suggestTrackMatches(params: {
   descriptor: MomentDescriptor;
   sourceTrack: { title: string; artist: string };
   limit?: number;
-}): Promise<Array<{ title: string; artist: string; explanation: string }>> {
+}): Promise<Array<{ title: string; artist: string; explanation: string; similarity_score: number }>> {
   const { descriptor, sourceTrack, limit = 6 } = params;
 
   const momentDesc = [

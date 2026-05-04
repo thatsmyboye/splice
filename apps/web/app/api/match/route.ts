@@ -65,8 +65,7 @@ async function buildClaudeSuggestions(params: {
       if (seen.has(t.id) || t.id === sourceSpotifyId) continue;
       seen.add(t.id);
 
-      // Taper similarity scores: first suggestion = 0.82, each step −0.03
-      const similarity = Math.max(0.5, 0.82 - i * 0.03);
+      const similarity = s.similarity_score;
 
       matches.push({
         spotify_id: t.id,
