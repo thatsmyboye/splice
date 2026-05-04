@@ -301,7 +301,7 @@ def extract_features(audio_bytes: bytes, spotify_id: str) -> TrackAnalysis:
     except Exception:
         key_name = "C"
         key_mode = "major"
-        key_confidence = 0.5
+        key_confidence = 0.0  # unknown — zero confidence suppresses key-boost scoring
 
     try:
         danceability_algo = ess.Danceability(sampleRate=SAMPLE_RATE)
