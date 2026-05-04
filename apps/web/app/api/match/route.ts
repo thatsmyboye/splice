@@ -314,7 +314,7 @@ export async function POST(request: NextRequest) {
   if (abMbids.length > 0) {
     const { data: cached_mb } = await serviceSupabase
       .from("musicbrainz_cache")
-      .select("mbid, title, artist, isrc, apple_music_id")
+      .select("mbid, title, artist, isrc, apple_music_id, popularity")
       .in("mbid", abMbids);
 
     const cachedMbids = new Set((cached_mb ?? []).map((r) => r.mbid));
@@ -325,7 +325,7 @@ export async function POST(request: NextRequest) {
         artist: row.artist,
         artwork_url: null,
         preview_url: null,
-        popularity: null,
+        popularity: row.popularity ?? null,
         apple_music_id: row.apple_music_id ?? null,
       });
     }
@@ -335,19 +335,34 @@ export async function POST(request: NextRequest) {
     if (uncachedMbids.length > 0) {
       const fetched = await getMBRecordings(uncachedMbids);
 
-      // Attempt Apple Music resolution for newly-fetched tracks that have an ISRC.
-      // Runs in parallel, failures are silently skipped.
-      const amLookups = await Promise.allSettled(
-        Array.from(fetched.values()).map(async (info) => {
-          if (!info.isrc) return { mbid: info.mbid, appleId: null };
-          const amSong = await getSongByISRC(info.isrc);
-          return { mbid: info.mbid, appleId: amSong?.id ?? null };
-        })
-      );
+      // Resolve Apple Music IDs and Spotify popularity in parallel.
+      // Both use the ISRC when available; failures are silently skipped.
+      const [amLookups, spotifyLookups] = await Promise.all([
+        Promise.allSettled(
+          Array.from(fetched.values()).map(async (info) => {
+            if (!info.isrc) return { mbid: info.mbid, appleId: null };
+            const amSong = await getSongByISRC(info.isrc);
+            return { mbid: info.mbid, appleId: amSong?.id ?? null };
+          })
+        ),
+        Promise.allSettled(
+          Array.from(fetched.values()).map(async (info) => {
+            if (!info.isrc) return { mbid: info.mbid, popularity: null };
+            const results = await searchTracks(`isrc:${info.isrc}`, 1);
+            const pop = results?.[0]?.popularity;
+            return { mbid: info.mbid, popularity: typeof pop === "number" ? pop : null };
+          })
+        ),
+      ]);
 
       const appleIds = new Map<string, string | null>();
       amLookups.forEach((r) => {
         if (r.status === "fulfilled") appleIds.set(r.value.mbid, r.value.appleId);
+      });
+
+      const spotifyPopularities = new Map<string, number | null>();
+      spotifyLookups.forEach((r) => {
+        if (r.status === "fulfilled") spotifyPopularities.set(r.value.mbid, r.value.popularity);
       });
 
       const newRows = Array.from(fetched.values()).map((info) => ({
@@ -356,6 +371,7 @@ export async function POST(request: NextRequest) {
         artist: info.artist,
         isrc: info.isrc ?? null,
         apple_music_id: appleIds.get(info.mbid) ?? null,
+        popularity: spotifyPopularities.get(info.mbid) ?? null,
       }));
 
       if (newRows.length > 0) {
@@ -374,7 +390,7 @@ export async function POST(request: NextRequest) {
           artist: info.artist,
           artwork_url: null,
           preview_url: null,
-          popularity: null,
+          popularity: spotifyPopularities.get(mbid) ?? null,
           apple_music_id: appleIds.get(mbid) ?? null,
         });
       }
