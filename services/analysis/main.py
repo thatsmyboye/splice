@@ -177,6 +177,20 @@ class EmbedRequest(BaseModel):
     features: dict
 
 
+class EmbedWindowRequest(BaseModel):
+    """Compute a 128-dim query embedding for a selected time window within a track."""
+    segments: list[dict]           # Full segments array from track_features (v2.0)
+    timestamp_s: float             # Start of selected window / single-mark timestamp
+    timestamp_end_s: Optional[float] = None  # End of window; None = single-mark
+    bpm: float = 120.0
+    key_name: str = "C"
+    key_mode: str = "major"
+    time_signature: int = 4
+    harmonic_rhythm: float = 0.0
+    danceability: float = 0.5
+    dynamic_complexity: float = 0.0
+
+
 class EmbedResponse(BaseModel):
     embedding: list[float]
 
@@ -542,3 +556,79 @@ async def embed(
         return EmbedResponse(embedding=embedding.tolist())
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Embedding failed: {str(e)}")
+
+
+@app.post("/embed-window", response_model=EmbedResponse)
+async def embed_window(
+    request: EmbedWindowRequest,
+    _: str = Depends(verify_secret),
+):
+    """
+    Compute a 128-dim query embedding for a selected time window.
+
+    Filters the stored segment array to segments overlapping the requested
+    window, then runs the same build_embedding() pipeline used during full
+    track analysis. This produces a query vector in the same space as the
+    catalog, making the pgvector search moment-aware rather than track-level.
+
+    For a single-mark timestamp, the containing segment (or nearest segment)
+    is used. Falls back to all segments if no window segments are found.
+    """
+    all_segs = request.segments
+    if not all_segs:
+        raise HTTPException(status_code=400, detail="No segments provided")
+
+    ts = request.timestamp_s
+    te = request.timestamp_end_s
+
+    if te is not None and te > ts:
+        # Window: all segments that overlap [ts, te)
+        window_segs = [
+            s for s in all_segs
+            if s["start_s"] < te and (s["start_s"] + s.get("duration_s", 0.0)) > ts
+        ]
+    else:
+        # Single mark: segment containing ts, or nearest segment
+        containing = [
+            s for s in all_segs
+            if s["start_s"] <= ts < (s["start_s"] + s.get("duration_s", 0.0))
+        ]
+        window_segs = containing if containing else [
+            min(all_segs, key=lambda s: abs(s["start_s"] - ts))
+        ]
+
+    if not window_segs:
+        window_segs = all_segs
+
+    seg_vectors: list[np.ndarray] = []
+    chroma_arrays: list[np.ndarray] = []
+    mfcc_arrays: list[np.ndarray] = []
+
+    for s in window_segs:
+        chroma = np.array(s.get("chroma_vector", [0.0] * N_CHROMA), dtype=float)
+        mfcc = np.array(s.get("mfcc_means", [0.0] * N_MFCC), dtype=float)
+        energy = float(s.get("energy", 0.0))
+        centroid = float(s.get("spectral_centroid", 0.0))
+        loudness = float(s.get("loudness_db", -60.0))
+        # Segment vector layout matches build_embedding() expectation:
+        # index 0=energy, 1=centroid, 2=loudness, 3:15=chroma, 15:28=mfcc
+        seg_vectors.append(np.concatenate([[energy, centroid, loudness], chroma, mfcc]))
+        chroma_arrays.append(chroma)
+        mfcc_arrays.append(mfcc)
+
+    global_chroma = np.mean(chroma_arrays, axis=0)
+    global_mfcc = np.mean(mfcc_arrays, axis=0)
+
+    embedding = build_embedding(
+        segment_vectors=seg_vectors,
+        bpm=request.bpm,
+        danceability=request.danceability,
+        dynamic_complexity=request.dynamic_complexity,
+        global_chroma=global_chroma,
+        global_mfcc=global_mfcc,
+        key_name=request.key_name,
+        key_mode=request.key_mode,
+        time_signature=request.time_signature,
+        harmonic_rhythm=request.harmonic_rhythm,
+    )
+    return EmbedResponse(embedding=embedding.tolist())
