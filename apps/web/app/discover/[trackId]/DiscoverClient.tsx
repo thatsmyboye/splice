@@ -35,7 +35,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Spotify popularity ≤ 45 is a rough proxy for tracks with fewer than ~1.5M streams.
-  // AcousticBrainz tracks (popularity === null) are always included — they're inherently obscure.
+  // popularity === null means the track wasn't found on Spotify at all — genuinely obscure.
   const DEEP_CUT_POPULARITY_MAX = 45;
   const visibleMatches = deepCutMode
     ? matches.filter((m) => m.popularity === null || m.popularity <= DEEP_CUT_POPULARITY_MAX)
