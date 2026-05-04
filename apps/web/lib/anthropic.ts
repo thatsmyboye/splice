@@ -227,12 +227,22 @@ Respond with ONLY valid JSON, no preamble or explanation:
 
 Use exact, Spotify-searchable titles and artist names. Suggest 5–7 songs.`;
 
+const SUGGEST_DEEP_CUT_ADDENDUM = `
+
+DEEP CUT MODE — this is a hard requirement, not a preference:
+- Every suggestion must be from an artist who is genuinely obscure or underground. No exceptions.
+- Banned: Grammy winners, artists on major labels (Universal, Sony, Warner, Atlantic, Columbia, Republic, etc.), artists with more than 2 million Spotify monthly listeners, artists who have appeared on mainstream radio, artists who have charted on Billboard Hot 100.
+- Allowed: cult underground acts, artists on small independent labels, regional or local artists, self-released music, artists known only within niche communities, deep B-side or bonus-track cuts from artists who themselves never crossed into mainstream awareness.
+- If you are not certain an artist is obscure enough, exclude them and choose someone more obscure.
+- The user's entire goal is to find music they have almost certainly never encountered before.`;
+
 export async function suggestTrackMatches(params: {
   descriptor: MomentDescriptor;
   sourceTrack: { title: string; artist: string };
   limit?: number;
+  deepCut?: boolean;
 }): Promise<Array<{ title: string; artist: string; explanation: string; similarity_score: number }>> {
-  const { descriptor, sourceTrack, limit = 6 } = params;
+  const { descriptor, sourceTrack, limit = 6, deepCut = false } = params;
 
   const momentDesc = [
     `Energy: ${descriptor.energy_profile_label} (${descriptor.energy_profile.toFixed(2)})`,
@@ -244,6 +254,10 @@ export async function suggestTrackMatches(params: {
     `Context: ${descriptor.reasoning}`,
   ].join("\n");
 
+  const systemPrompt = deepCut
+    ? SUGGEST_SYSTEM_PROMPT + SUGGEST_DEEP_CUT_ADDENDUM
+    : SUGGEST_SYSTEM_PROMPT;
+
   const userPrompt = `Source song: "${sourceTrack.title}" by ${sourceTrack.artist}
 
 This musical moment has these qualities:
@@ -254,7 +268,7 @@ Suggest ${limit} other songs (not "${sourceTrack.title}") that contain a moment 
   const response = await client.messages.create({
     model: MODEL,
     max_tokens: 1024,
-    system: SUGGEST_SYSTEM_PROMPT,
+    system: systemPrompt,
     messages: [{ role: "user", content: userPrompt }],
   });
 

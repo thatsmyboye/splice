@@ -18,7 +18,12 @@ const RequestSchema = z.object({
   momentId: z.string().uuid(),
   sourceSpotifyId: z.string().min(1),
   limit: z.number().int().min(1).max(50).default(20),
+  deepCut: z.boolean().default(false),
 });
+
+// Spotify popularity 0–100. Tracks at or below this threshold are considered obscure.
+// Roughly corresponds to artists with fewer than ~1M streams total.
+const DEEP_CUT_MAX_POPULARITY = 40;
 
 /**
  * When the pgvector catalog is empty, ask Claude to suggest real songs and
@@ -29,8 +34,9 @@ async function buildClaudeSuggestions(params: {
   descriptor: MomentDescriptor;
   sourceSpotifyId: string;
   serviceSupabase: ReturnType<typeof getServiceClient>;
+  deepCut?: boolean;
 }): Promise<MomentMatch[]> {
-  const { descriptor, sourceSpotifyId, serviceSupabase } = params;
+  const { descriptor, sourceSpotifyId, serviceSupabase, deepCut = false } = params;
 
   const { data: sourceTrackData } = await serviceSupabase
     .from("tracks")
@@ -48,6 +54,7 @@ async function buildClaudeSuggestions(params: {
         title: sourceTrackData.title,
         artist: sourceTrackData.artist,
       },
+      deepCut,
     });
   } catch {
     return [];
@@ -91,6 +98,17 @@ async function buildClaudeSuggestions(params: {
     }
   }
 
+  if (deepCut) {
+    const sourceArtistLower = sourceTrackData.artist.toLowerCase();
+    return matches.filter((m) => {
+      const popularityOk = m.popularity === null || m.popularity <= DEEP_CUT_MAX_POPULARITY;
+      const artistLower = m.artist.toLowerCase();
+      const sameArtist =
+        artistLower.includes(sourceArtistLower) || sourceArtistLower.includes(artistLower);
+      return popularityOk && !sameArtist;
+    });
+  }
+
   return matches;
 }
 
@@ -124,16 +142,20 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Invalid request" }, { status: 400 });
   }
 
-  const { momentId, sourceSpotifyId, limit } = parsed.data;
+  const { momentId, sourceSpotifyId, limit, deepCut } = parsed.data;
   const serviceSupabase = getServiceClient();
 
-  // Check cache — key is (moment_id, source_spotify_id) so results are
-  // never shared across different source tracks.
+  // Cache key includes ":deep" suffix for deep cut results so they're stored
+  // separately from normal results for the same moment.
+  const cacheSourceId = deepCut ? `${sourceSpotifyId}:deep` : sourceSpotifyId;
+
+  // Check cache — key is (moment_id, cache_source_id) so results are
+  // never shared across different source tracks or modes.
   const { data: cached } = await serviceSupabase
     .from("moment_matches")
     .select("results, created_at")
     .eq("moment_id", momentId)
-    .eq("source_spotify_id", sourceSpotifyId)
+    .eq("source_spotify_id", cacheSourceId)
     .gt("expires_at", new Date().toISOString())
     .single();
 
@@ -200,12 +222,17 @@ export async function POST(request: NextRequest) {
       }
     : null;
 
+  // When deep cut is on, over-fetch candidates so the popularity filter has enough
+  // material to find genuinely obscure tracks. Popular songs cluster at the top of
+  // the similarity ranking, so we need to look further down the list.
+  const candidateCount = deepCut ? Math.min(limit * 5, 100) : limit;
+
   // pgvector similarity search via RPC (with optional COF key boosting for v2)
   const { data: rawMatches, error: matchError } = await serviceSupabase.rpc(
     "match_tracks",
     {
       query_embedding: sourceFeatures.embedding,
-      match_count: limit,
+      match_count: candidateCount,
       exclude_spotify_id: sourceSpotifyId,
       source_key_name: isV2 ? (sourceFeatures.key_name ?? null) : null,
       source_key_mode: isV2 ? (sourceFeatures.key_mode ?? null) : null,
@@ -231,6 +258,7 @@ export async function POST(request: NextRequest) {
       descriptor,
       sourceSpotifyId,
       serviceSupabase,
+      deepCut,
     });
 
     if (matches.length > 0) {
@@ -240,7 +268,7 @@ export async function POST(request: NextRequest) {
       await serviceSupabase
         .from("moment_matches")
         .upsert(
-          { moment_id: momentId, source_spotify_id: sourceSpotifyId, results: matches, expires_at: expiresAt },
+          { moment_id: momentId, source_spotify_id: cacheSourceId, results: matches, expires_at: expiresAt },
           { onConflict: "moment_id,source_spotify_id" }
         );
     }
@@ -413,21 +441,62 @@ export async function POST(request: NextRequest) {
     harmonic_rhythm: number | null;
   };
 
-  // Claude re-ranking explanations (top 10 only to save tokens)
-  const matchesForClaude = (rawMatches as RawMatch[])
+  // Build preliminary match objects for all resolved candidates
+  const preliminaryMatches: MomentMatch[] = (rawMatches as RawMatch[])
     .filter((m) => trackMap.has(m.spotify_id))
-    .slice(0, 10)
     .map((m) => {
       const t = trackMap.get(m.spotify_id)!;
+      const segments = segmentsMap.get(m.spotify_id);
+      const firstSeg = segments?.[0];
+      const isAB = m.spotify_id.startsWith("ab:");
       return {
         spotify_id: m.spotify_id,
         title: t.title,
         artist: t.artist,
+        artwork_url: t.artwork_url,
+        preview_url: t.preview_url,
+        timestamp_s: firstSeg?.start_s ?? null,
         similarity_score: m.similarity,
-        key_name: m.key_name,
-        key_mode: m.key_mode,
+        claude_explanation: "",
+        spotify_embed_url: isAB
+          ? `https://musicbrainz.org/recording/${m.spotify_id.slice(3)}`
+          : `https://open.spotify.com/embed/track/${m.spotify_id}`,
+        apple_music_url: t.apple_music_id ? amUrl(t.apple_music_id) : null,
+        bpm: m.bpm ?? null,
+        key_name: m.key_name ?? null,
+        key_mode: (m.key_mode as "major" | "minor" | null) ?? null,
+        time_signature: (m.time_signature as 3 | 4 | null) ?? null,
+        harmonic_rhythm: m.harmonic_rhythm ?? null,
+        chord_label: firstSeg?.chord_label ?? null,
+        popularity: t.popularity,
       };
     });
+
+  // Apply deep cut filter before Claude explanations so explanations target the
+  // tracks the user will actually see, not the full over-fetched candidate set.
+  const sourceArtistLower = sourceTrackData?.artist.toLowerCase() ?? "";
+  const filteredMatches = deepCut
+    ? preliminaryMatches
+        .filter((m) => {
+          const popularityOk = m.popularity === null || m.popularity <= DEEP_CUT_MAX_POPULARITY;
+          const artistLower = m.artist.toLowerCase();
+          const sameArtist =
+            artistLower.includes(sourceArtistLower) || sourceArtistLower.includes(artistLower);
+          return popularityOk && !sameArtist;
+        })
+        .slice(0, limit)
+    : preliminaryMatches;
+
+  // Claude re-ranking explanations — explain whichever tracks survived the filter
+  // (top 10 only to save tokens)
+  const matchesForClaude = filteredMatches.slice(0, 10).map((m) => ({
+    spotify_id: m.spotify_id,
+    title: m.title,
+    artist: m.artist,
+    similarity_score: m.similarity_score,
+    key_name: m.key_name,
+    key_mode: m.key_mode,
+  }));
 
   let explanations = new Map<string, string>();
   if (sourceTrackData && matchesForClaude.length > 0) {
@@ -445,43 +514,17 @@ export async function POST(request: NextRequest) {
     }
   }
 
-  // Build final results — include both Spotify and AcousticBrainz tracks
-  const matches: MomentMatch[] = (rawMatches as RawMatch[])
-    .filter((m) => trackMap.has(m.spotify_id))
-    .map((m) => {
-      const t = trackMap.get(m.spotify_id)!;
-      const segments = segmentsMap.get(m.spotify_id);
-      const firstSeg = segments?.[0];
-      const isAB = m.spotify_id.startsWith("ab:");
-      return {
-        spotify_id: m.spotify_id,
-        title: t.title,
-        artist: t.artist,
-        artwork_url: t.artwork_url,
-        preview_url: t.preview_url,
-        timestamp_s: firstSeg?.start_s ?? null,
-        similarity_score: m.similarity,
-        claude_explanation: explanations.get(m.spotify_id) ?? "",
-        spotify_embed_url: isAB
-          ? `https://musicbrainz.org/recording/${m.spotify_id.slice(3)}`
-          : `https://open.spotify.com/embed/track/${m.spotify_id}`,
-        apple_music_url: t.apple_music_id ? amUrl(t.apple_music_id) : null,
-        bpm: m.bpm ?? null,
-        key_name: m.key_name ?? null,
-        key_mode: (m.key_mode as "major" | "minor" | null) ?? null,
-        time_signature: (m.time_signature as 3 | 4 | null) ?? null,
-        harmonic_rhythm: m.harmonic_rhythm ?? null,
-        chord_label: firstSeg?.chord_label ?? null,
-        popularity: t.popularity,
-      };
-    });
+  const matches: MomentMatch[] = filteredMatches.map((m) => ({
+    ...m,
+    claude_explanation: explanations.get(m.spotify_id) ?? "",
+  }));
 
   // Cache results with a fresh 7-day TTL
   const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
   await serviceSupabase
     .from("moment_matches")
     .upsert(
-      { moment_id: momentId, source_spotify_id: sourceSpotifyId, results: matches, expires_at: expiresAt },
+      { moment_id: momentId, source_spotify_id: cacheSourceId, results: matches, expires_at: expiresAt },
       { onConflict: "moment_id,source_spotify_id" }
     );
 

@@ -34,13 +34,15 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
   const [deepCutMode, setDeepCutMode] = useState(false);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Spotify popularity ≤ 45 is a rough proxy for tracks with fewer than ~1.5M streams.
-  // popularity === null means the track wasn't found on Spotify at all — genuinely obscure.
-  const DEEP_CUT_POPULARITY_MAX = 45;
+  // Server-side filtering is the primary mechanism for Deep Cut mode — it over-fetches
+  // candidates from pgvector and filters before returning, so results here are already
+  // obscure when deepCutMode was on at search time. The client-side filter below acts
+  // as a lightweight display guard for any stragglers (e.g. toggling mode post-search).
+  const DEEP_CUT_MAX_POPULARITY = 40;
   const sourceArtistNames = track.artists.map((a) => a.name.toLowerCase());
   const visibleMatches = deepCutMode
     ? matches.filter((m) => {
-        const popularityOk = m.popularity === null || m.popularity <= DEEP_CUT_POPULARITY_MAX;
+        const popularityOk = m.popularity === null || m.popularity <= DEEP_CUT_MAX_POPULARITY;
         const matchArtistLower = m.artist.toLowerCase();
         const sameArtist = sourceArtistNames.some(
           (name) => matchArtistLower.includes(name) || name.includes(matchArtistLower)
@@ -68,7 +70,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
     const matchRes = await fetch("/api/match", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ momentId, sourceSpotifyId: track.id }),
+      body: JSON.stringify({ momentId, sourceSpotifyId: track.id, deepCut: deepCutMode }),
     });
 
     if (!matchRes.ok) {
@@ -269,7 +271,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
             <Scissors className={`h-4 w-4 shrink-0 ${deepCutMode ? "text-primary" : ""}`} />
             <span className="font-medium">Deep Cut mode</span>
             <span className="ml-auto text-xs opacity-70">
-              {deepCutMode ? "on — obscure & other-artist only" : "off — show all"}
+              {deepCutMode ? "on — searches for obscure tracks only" : "off — show all results"}
             </span>
           </button>
 
