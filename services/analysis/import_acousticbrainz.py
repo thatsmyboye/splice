@@ -202,10 +202,17 @@ def build_embedding(data: dict) -> Optional[np.ndarray]:
             features.append(float(np.clip(np.log1p(abs(var_val)) / var_scale, 0.0, 1.0)))
 
         # Rhythm (4)
-        bpm          = float(rh.get("bpm", 120.0) or 120.0)
-        danceability = float(rh.get("danceability", 1.5) or 1.5)
-        onset_rate   = float(rh.get("onset_rate", 5.0) or 5.0)
-        beats_count  = float(rh.get("beats_count", 100) or 100)
+        # Use explicit None checks so valid zero values (e.g. danceability=0, onset_rate=0)
+        # are not silently replaced by the `or` fallback. BPM and beats_count cannot
+        # meaningfully be 0, so the `or` fallback is still correct for those two.
+        _bpm         = rh.get("bpm")
+        _dance       = rh.get("danceability")
+        _onset       = rh.get("onset_rate")
+        _beats       = rh.get("beats_count")
+        bpm          = float(_bpm   if _bpm   is not None and _bpm   != 0 else 120.0)
+        danceability = float(_dance if _dance is not None              else 1.5)
+        onset_rate   = float(_onset if _onset is not None              else 5.0)
+        beats_count  = float(_beats if _beats is not None and _beats  != 0 else 100)
         features.extend([
             float(np.clip((bpm - 40.0) / 220.0, 0.0, 1.0)),
             float(np.clip(danceability / 3.0, 0.0, 1.0)),
@@ -214,8 +221,11 @@ def build_embedding(data: dict) -> Optional[np.ndarray]:
         ])
 
         # Dynamics (2)
-        loudness           = float(ll.get("average_loudness", 0.5) or 0.5)
-        dynamic_complexity = float(ll.get("dynamic_complexity", 5.0) or 5.0)
+        # loudness is in [0,1] so 0 is a valid value; dynamic_complexity can also be 0.
+        _loudness    = ll.get("average_loudness")
+        _dyn         = ll.get("dynamic_complexity")
+        loudness           = float(_loudness if _loudness is not None else 0.5)
+        dynamic_complexity = float(_dyn      if _dyn      is not None else 5.0)
         features.extend([
             float(np.clip(loudness, 0.0, 1.0)),
             float(np.clip(dynamic_complexity / 10.0, 0.0, 1.0)),
@@ -229,8 +239,9 @@ def build_embedding(data: dict) -> Optional[np.ndarray]:
 
         # Mode, key strength, chord change rate (3)
         mode = 1.0 if str(to.get("key_scale", to.get("chords_scale", "major"))).lower() == "major" else 0.0
-        key_strength       = float(to.get("key_strength", 0.5) or 0.5)
-        chord_change_rate  = float(to.get("chords_changes_rate", 0.0) or 0.0)
+        _ks = to.get("key_strength")
+        key_strength       = float(_ks if _ks is not None else 0.5)
+        chord_change_rate  = float(to.get("chords_changes_rate") or 0.0)
         features.extend([
             mode,
             float(np.clip(key_strength, 0.0, 1.0)),

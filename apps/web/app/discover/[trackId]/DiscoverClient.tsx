@@ -37,8 +37,16 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
   // Spotify popularity ≤ 45 is a rough proxy for tracks with fewer than ~1.5M streams.
   // popularity === null means the track wasn't found on Spotify at all — genuinely obscure.
   const DEEP_CUT_POPULARITY_MAX = 45;
+  const sourceArtistNames = track.artists.map((a) => a.name.toLowerCase());
   const visibleMatches = deepCutMode
-    ? matches.filter((m) => m.popularity === null || m.popularity <= DEEP_CUT_POPULARITY_MAX)
+    ? matches.filter((m) => {
+        const popularityOk = m.popularity === null || m.popularity <= DEEP_CUT_POPULARITY_MAX;
+        const matchArtistLower = m.artist.toLowerCase();
+        const sameArtist = sourceArtistNames.some(
+          (name) => matchArtistLower.includes(name) || name.includes(matchArtistLower)
+        );
+        return popularityOk && !sameArtist;
+      })
     : matches;
 
   const artwork = track.album.images[0]?.url;
@@ -261,7 +269,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
             <Scissors className={`h-4 w-4 shrink-0 ${deepCutMode ? "text-primary" : ""}`} />
             <span className="font-medium">Deep Cut mode</span>
             <span className="ml-auto text-xs opacity-70">
-              {deepCutMode ? "on — hiding mainstream tracks" : "off — show all"}
+              {deepCutMode ? "on — obscure & other-artist only" : "off — show all"}
             </span>
           </button>
 
