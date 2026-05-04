@@ -129,6 +129,56 @@ function amUrl(appleId: string): string {
   return `https://music.apple.com/album/${appleId}`;
 }
 
+/**
+ * Ask the analysis service to embed the feature window defined by
+ * [timestamp_s, timestamp_end_s) into the same 128-dim space as the catalog.
+ * Returns null on any failure so callers can fall back to the track embedding.
+ */
+async function fetchWindowEmbedding(params: {
+  segments: unknown[];
+  timestamp_s: number;
+  timestamp_end_s: number | null;
+  bpm: number | null;
+  key_name: string | null;
+  key_mode: string | null;
+  time_signature: number | null;
+  harmonic_rhythm: number | null;
+  danceability: number | null;
+  dynamic_complexity: number | null;
+}): Promise<number[] | null> {
+  const serviceUrl = process.env.ANALYSIS_SERVICE_URL;
+  const serviceSecret = process.env.ANALYSIS_SERVICE_SECRET;
+  if (!serviceUrl || !serviceSecret) return null;
+
+  try {
+    const res = await fetch(`${serviceUrl}/embed-window`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Service-Secret": serviceSecret,
+      },
+      body: JSON.stringify({
+        segments: params.segments,
+        timestamp_s: params.timestamp_s,
+        timestamp_end_s: params.timestamp_end_s ?? undefined,
+        bpm: params.bpm ?? 120,
+        key_name: params.key_name ?? "C",
+        key_mode: params.key_mode ?? "major",
+        time_signature: params.time_signature ?? 4,
+        harmonic_rhythm: params.harmonic_rhythm ?? 0,
+        danceability: params.danceability ?? 0.5,
+        dynamic_complexity: params.dynamic_complexity ?? 0,
+      }),
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json() as { embedding: number[] };
+    return data.embedding ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export async function POST(request: NextRequest) {
   let body: unknown;
   try {
@@ -168,10 +218,10 @@ export async function POST(request: NextRequest) {
     });
   }
 
-  // Fetch moment descriptor
+  // Fetch moment descriptor and timestamp window
   const { data: moment } = await serviceSupabase
     .from("moments")
-    .select("moment_descriptor, timestamp_start_s")
+    .select("moment_descriptor, timestamp_start_s, timestamp_end_s")
     .eq("id", momentId)
     .single();
 
@@ -184,7 +234,7 @@ export async function POST(request: NextRequest) {
   // Get source track embedding + harmonic context
   const { data: sourceFeatures } = await serviceSupabase
     .from("track_features")
-    .select("embedding, key_name, key_mode, bpm, time_signature, analysis_version, segments")
+    .select("embedding, key_name, key_mode, bpm, time_signature, harmonic_rhythm, danceability, dynamic_complexity, analysis_version, segments")
     .eq("spotify_id", sourceSpotifyId)
     .single();
 
@@ -227,11 +277,43 @@ export async function POST(request: NextRequest) {
   // the similarity ranking, so we need to look further down the list.
   const candidateCount = deepCut ? Math.min(limit * 5, 100) : limit;
 
+  // Resolve the query embedding. When the source track has v2.0 analysis and
+  // the user selected a timestamp (not description-only), ask the analysis
+  // service to embed just the window's segments so the search is moment-aware
+  // rather than track-level. Fall back to the stored track embedding on failure.
+  const momentTimestamp = (moment as { timestamp_start_s?: number | null }).timestamp_start_s ?? null;
+  const momentTimestampEnd = (moment as { timestamp_end_s?: number | null }).timestamp_end_s ?? null;
+
+  let queryEmbedding: number[] = sourceFeatures.embedding as number[];
+
+  if (
+    isV2 &&
+    momentTimestamp !== null &&
+    Array.isArray(sourceFeatures.segments) &&
+    (sourceFeatures.segments as unknown[]).length > 0
+  ) {
+    const windowEmbedding = await fetchWindowEmbedding({
+      segments: sourceFeatures.segments as unknown[],
+      timestamp_s: momentTimestamp,
+      timestamp_end_s: momentTimestampEnd,
+      bpm: sourceFeatures.bpm ?? null,
+      key_name: sourceFeatures.key_name ?? null,
+      key_mode: sourceFeatures.key_mode ?? null,
+      time_signature: sourceFeatures.time_signature ?? null,
+      harmonic_rhythm: (sourceFeatures as { harmonic_rhythm?: number | null }).harmonic_rhythm ?? null,
+      danceability: (sourceFeatures as { danceability?: number | null }).danceability ?? null,
+      dynamic_complexity: (sourceFeatures as { dynamic_complexity?: number | null }).dynamic_complexity ?? null,
+    });
+    if (windowEmbedding) {
+      queryEmbedding = windowEmbedding;
+    }
+  }
+
   // pgvector similarity search via RPC (with optional COF key boosting for v2)
   const { data: rawMatches, error: matchError } = await serviceSupabase.rpc(
     "match_tracks",
     {
-      query_embedding: sourceFeatures.embedding,
+      query_embedding: queryEmbedding,
       match_count: candidateCount,
       exclude_spotify_id: sourceSpotifyId,
       source_key_name: isV2 ? (sourceFeatures.key_name ?? null) : null,
