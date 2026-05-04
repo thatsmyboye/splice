@@ -116,7 +116,7 @@ export async function interpretMoment(params: {
 }): Promise<MomentDescriptor> {
   const { track, timestamp_s, timestamp_end_s, description, genres, harmonicContext } = params;
 
-  if (!timestamp_s && !description) {
+  if (timestamp_s === undefined && !description) {
     throw new Error("At least one of timestamp_s or description is required");
   }
 
