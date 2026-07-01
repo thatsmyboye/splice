@@ -41,58 +41,26 @@ curl -X POST http://localhost:8000/analyze \
    - `PORT=8000`
 6. Copy the generated domain → set as `ANALYSIS_SERVICE_URL` in web app
 
-## AcousticBrainz Bulk Import
+## Building initial catalog coverage
 
-### Prerequisites
-```bash
-pip install supabase pandas tqdm
-```
+**Bulk-seed script (current approach)** — populates `track_features` before
+launch by running a diverse list of tracks through the *same* on-demand
+librosa/essentia pipeline (`services/analysis/main.py`) that handles live user
+searches. See `apps/web/scripts/seed-catalog.ts`. Because every row is built
+by one embedding function, there's no cross-space comparison problem, and
+every seeded track has genuine per-segment (moment-level) features — not
+just track-level aggregates.
 
-### Download the data
-Go to https://acousticbrainz.org/download
-
-Download the **lowlevel CSV** file:
-- `acousticbrainz-lowlevel-features.tar.bz2` (~2GB compressed, ~8GB uncompressed)
-
-Extract:
-```bash
-tar -xjf acousticbrainz-lowlevel-features.tar.bz2
-```
-
-### Run the import
-```bash
-python import_acousticbrainz.py \
-  --input acousticbrainz-lowlevel-features.csv \
-  --supabase-url https://YOUR_PROJECT.supabase.co \
-  --supabase-key YOUR_SERVICE_ROLE_KEY \
-  --limit 500000
-```
-
-Options:
-- `--limit N`: import at most N rows (default 500K)
-- `--offset N`: skip first N rows (useful for resuming interrupted imports)
-- `--batch-size N`: rows per Supabase batch insert (default 500)
-
-### Verify the import
-In Supabase SQL editor:
-```sql
-SELECT
-  count(*) as total,
-  source,
-  min(created_at) as first_imported,
-  max(created_at) as last_imported
-FROM track_features
-GROUP BY source;
-```
-
-### Notes on the AB data
-- AcousticBrainz CSV dump contains track-level aggregates only (no segments)
-- MBIDs in the AB dataset link to MusicBrainz recordings
-- Tracks imported from AB use `spotify_id` prefixed with `ab:` (e.g. `ab:abc123-...mbid...`)
-- When a user plays a Spotify track, the system checks for a matching MBID to find AB features,
-  then falls back to on-demand analysis via Spotify 30s preview if no match found
-- The embedding quality for AB tracks is lower than on-demand analysis (fewer features available)
-  but still useful for cold-start catalog coverage
+**AcousticBrainz import (legacy, not recommended)** — `services/analysis/import_acousticbrainz.py`
+imports AcousticBrainz's pre-computed low-level features in bulk. This was
+the original cold-start plan, but AcousticBrainz only has track-level
+aggregate stats (no real segments — `build_segments()` fabricates one
+synthetic full-track segment per recording), and its 128-dim embedding layout
+is built completely differently from the live analysis service's layout
+(see `import_acousticbrainz.py`'s docstring vs. `main.py`'s `build_embedding()`).
+Rows from the two sources are not directly comparable by cosine similarity.
+The script and `services/analysis/README.md` instructions are kept for
+reference but are superseded by the bulk-seed script above.
 
 ## Endpoints
 

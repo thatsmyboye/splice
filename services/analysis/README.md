@@ -41,7 +41,21 @@ curl -X POST http://localhost:8000/analyze \
    - `PORT=8000`
 6. Copy the generated domain → set as `ANALYSIS_SERVICE_URL` in web app
 
-## AcousticBrainz Bulk Import
+## AcousticBrainz Bulk Import (legacy — superseded)
+
+**This approach is no longer recommended.** AcousticBrainz's low-level data is
+track-level aggregates only (no real segment boundaries — `build_segments()`
+below fabricates one synthetic full-track segment), and the 128-dim embedding
+layout this script builds is structurally different from the one
+`services/analysis/main.py`'s `build_embedding()` produces for on-demand
+analysis. The two are not comparable by cosine similarity, which silently
+broke match quality for any AcousticBrainz-sourced result.
+
+The current approach is `apps/web/scripts/seed-catalog.ts`, which builds
+initial catalog coverage by running a diverse seed track list through the
+*same* on-demand pipeline used for live user searches — one embedding space,
+genuine per-segment features, from the first row on. This section is kept
+for reference only.
 
 One-time setup that pre-populates `track_features` with ~500K tracks so the app
 has a searchable corpus before any user triggers on-demand analysis.
