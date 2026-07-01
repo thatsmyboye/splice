@@ -377,21 +377,22 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 ## Phase Plan
 
 ### Phase 1 — Core Loop (MVP)
-- [ ] Auth (Google OAuth via Supabase)
-- [ ] Track search (Spotify metadata)
-- [ ] Waveform scrubber + timestamp selection
-- [ ] Natural language moment description input
-- [ ] Claude moment interpretation → `MomentDescriptor`
-- [ ] On-demand audio analysis (30s preview → librosa → pgvector)
-- [ ] pgvector similarity search → match results
-- [ ] Moment result cards with timestamp + explanation
+- [x] Auth (Google OAuth via Supabase)
+- [x] Track search (Spotify metadata)
+- [x] Waveform scrubber + timestamp selection (includes window/range selection, not just a single point)
+- [x] Natural language moment description input
+- [x] Claude moment interpretation → `MomentDescriptor`
+- [x] On-demand audio analysis (30s preview → librosa → pgvector), incl. chord/key/time-signature detection beyond original scope
+- [x] pgvector similarity search → match results, incl. moment-window (not just full-track) embedding and Deep Cut mode
+- [x] Moment result cards with timestamp + explanation
 
 ### Phase 2 — Intelligence Layer
-- [ ] Saved moments library (per user)
+- [ ] Saved moments library (per user) — `/library` page reads saved moments, but no UI action writes `is_saved: true` yet; nothing is actually savable today
 - [ ] Moment-based playlist export to Spotify
-- [ ] Match feedback (thumbs up/down) → descriptor refinement
-- [ ] Pre-indexed AcousticBrainz corpus searchable without on-demand analysis
+- [ ] Match feedback (thumbs up/down) → descriptor refinement — `moment_feedback` table exists in schema, no API/UI wired up
+- [ ] Pre-indexed corpus searchable without on-demand analysis — was attempted via AcousticBrainz import, but that data is track-level-only and embeds in an incompatible space from on-demand analysis (see `services/analysis/README.md`); superseded by the bulk-seed script (`apps/web/scripts/seed-catalog.ts`), not yet run
 - [ ] Shareable moment cards (OG image generation)
+- [x] Apple Music integration (genre enrichment, ISRC resolution, preview-URL fallback, deep links) — not originally scoped, shipped alongside Phase 1
 
 ### Phase 3 — Social / Network Effects
 - [ ] Public moment collections

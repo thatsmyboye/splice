@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import { explainMatches, suggestTrackMatches } from "@/lib/anthropic";
+import { explainMatches } from "@/lib/anthropic";
 import { getMBRecordings } from "@/lib/musicbrainz";
 import { getSongByISRC } from "@/lib/apple-music";
 import { searchTracks } from "@/lib/spotify";
@@ -24,93 +24,6 @@ const RequestSchema = z.object({
 // Spotify popularity 0–100. Tracks at or below this threshold are considered obscure.
 // Roughly corresponds to artists with fewer than ~1M streams total.
 const DEEP_CUT_MAX_POPULARITY = 40;
-
-/**
- * When the pgvector catalog is empty, ask Claude to suggest real songs and
- * resolve them to Spotify metadata. Used as a fallback until enough tracks
- * have been analyzed to produce vector results.
- */
-async function buildClaudeSuggestions(params: {
-  descriptor: MomentDescriptor;
-  sourceSpotifyId: string;
-  serviceSupabase: ReturnType<typeof getServiceClient>;
-  deepCut?: boolean;
-}): Promise<MomentMatch[]> {
-  const { descriptor, sourceSpotifyId, serviceSupabase, deepCut = false } = params;
-
-  const { data: sourceTrackData } = await serviceSupabase
-    .from("tracks")
-    .select("title, artist")
-    .eq("spotify_id", sourceSpotifyId)
-    .single();
-
-  if (!sourceTrackData) return [];
-
-  let suggestions: Array<{ title: string; artist: string; explanation: string; similarity_score: number }>;
-  try {
-    suggestions = await suggestTrackMatches({
-      descriptor,
-      sourceTrack: {
-        title: sourceTrackData.title,
-        artist: sourceTrackData.artist,
-      },
-      deepCut,
-    });
-  } catch {
-    return [];
-  }
-
-  const matches: MomentMatch[] = [];
-  const seen = new Set<string>();
-
-  for (let i = 0; i < suggestions.length; i++) {
-    const s = suggestions[i];
-    try {
-      const results = await searchTracks(`${s.title} ${s.artist}`, 1);
-      if (results.length === 0) continue;
-      const t = results[0];
-      if (seen.has(t.id) || t.id === sourceSpotifyId) continue;
-      seen.add(t.id);
-
-      const similarity = s.similarity_score;
-
-      matches.push({
-        spotify_id: t.id,
-        title: t.name,
-        artist: t.artists.map((a: { name: string }) => a.name).join(", "),
-        artwork_url: t.album?.images?.[0]?.url ?? null,
-        preview_url: t.preview_url ?? null,
-        timestamp_s: null,
-        similarity_score: similarity,
-        claude_explanation: s.explanation,
-        spotify_embed_url: `https://open.spotify.com/embed/track/${t.id}`,
-        apple_music_url: null,
-        bpm: null,
-        key_name: null,
-        key_mode: null,
-        time_signature: null,
-        harmonic_rhythm: null,
-        chord_label: null,
-        popularity: t.popularity ?? null,
-      });
-    } catch {
-      // Skip suggestions whose Spotify search fails
-    }
-  }
-
-  if (deepCut) {
-    const sourceArtistLower = sourceTrackData.artist.toLowerCase();
-    return matches.filter((m) => {
-      const popularityOk = m.popularity === null || m.popularity <= DEEP_CUT_MAX_POPULARITY;
-      const artistLower = m.artist.toLowerCase();
-      const sameArtist =
-        artistLower.includes(sourceArtistLower) || sourceArtistLower.includes(artistLower);
-      return popularityOk && !sameArtist;
-    });
-  }
-
-  return matches;
-}
 
 function chordAtTimestamp(
   segments: Array<{ start_s: number; duration_s: number; chord_label?: string }>,
@@ -329,34 +242,31 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Synthetic embeddings (created from Claude descriptors) live in a different
-  // vector space than AcousticBrainz embeddings, so cosine similarity between
-  // the two spaces is not meaningful. Fewer than 5 results signals that the
-  // query vector didn't land near the catalog — fall back to Claude suggestions.
-  const MIN_VECTOR_RESULTS = 5;
-  if (!rawMatches || rawMatches.length < MIN_VECTOR_RESULTS) {
-    // Insufficient vector matches — ask Claude to suggest similar tracks
-    const matches = await buildClaudeSuggestions({
-      descriptor,
-      sourceSpotifyId,
-      serviceSupabase,
-      deepCut,
-    });
+  // Only show matches that clear a genuine-similarity bar — otherwise the
+  // over-fetched candidate tail (which pgvector always returns regardless of
+  // quality once the catalog has a handful of rows) gets displayed as if it
+  // were a real match. This threshold is a placeholder tuned for the current
+  // mixed-embedding-space catalog; retune once the bulk-seed catalog (single
+  // embedding space, real segment-level features throughout) is in place.
+  const MIN_SIMILARITY_SCORE = 0.5;
+  const qualifiedMatches = (rawMatches ?? []).filter(
+    (m: { similarity: number }) => m.similarity >= MIN_SIMILARITY_SCORE
+  );
 
-    if (matches.length > 0) {
-      const expiresAt = new Date(
-        Date.now() + 7 * 24 * 60 * 60 * 1000
-      ).toISOString();
-      await serviceSupabase
-        .from("moment_matches")
-        .upsert(
-          { moment_id: momentId, source_spotify_id: cacheSourceId, results: matches, expires_at: expiresAt },
-          { onConflict: "moment_id,source_spotify_id" }
-        );
-    }
+  if (qualifiedMatches.length === 0) {
+    // No real match clears the bar — honest empty state, no fabricated
+    // suggestions. Cache the empty result so we don't re-run the RPC on
+    // every repeat view of the same moment within the TTL window.
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    await serviceSupabase
+      .from("moment_matches")
+      .upsert(
+        { moment_id: momentId, source_spotify_id: cacheSourceId, results: [], expires_at: expiresAt },
+        { onConflict: "moment_id,source_spotify_id" }
+      );
 
     return NextResponse.json({
-      matches,
+      matches: [],
       cachedAt: null,
       analysis_pending: false,
       source_analysis,
@@ -364,7 +274,7 @@ export async function POST(request: NextRequest) {
   }
 
   // Fetch segments for matched tracks so we can show a real timestamp
-  const matchedIds = (rawMatches as Array<{ spotify_id: string }>).map((m) => m.spotify_id);
+  const matchedIds = qualifiedMatches.map((m: { spotify_id: string }) => m.spotify_id);
   const { data: featuresRows } = await serviceSupabase
     .from("track_features")
     .select("spotify_id, segments")
@@ -378,7 +288,7 @@ export async function POST(request: NextRequest) {
   const spotifyIds: string[] = [];
   const abMbids: string[] = [];
 
-  for (const m of rawMatches as Array<{ spotify_id: string }>) {
+  for (const m of qualifiedMatches as Array<{ spotify_id: string }>) {
     if (m.spotify_id.startsWith("ab:")) {
       abMbids.push(m.spotify_id.slice(3));
     } else {
@@ -524,7 +434,7 @@ export async function POST(request: NextRequest) {
   };
 
   // Build preliminary match objects for all resolved candidates
-  const preliminaryMatches: MomentMatch[] = (rawMatches as RawMatch[])
+  const preliminaryMatches: MomentMatch[] = (qualifiedMatches as RawMatch[])
     .filter((m) => trackMap.has(m.spotify_id))
     .map((m) => {
       const t = trackMap.get(m.spotify_id)!;

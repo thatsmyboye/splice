@@ -106,7 +106,7 @@ export interface SegmentFeatures {
 export interface TrackFeatures {
   spotify_id: string;
   mbid: string | null;
-  source: "acousticbrainz" | "on_demand" | "synthetic";
+  source: "acousticbrainz" | "on_demand" | "synthetic" | "seed";
   analysis_version: string;
   bpm: number;
   key_name: string;
