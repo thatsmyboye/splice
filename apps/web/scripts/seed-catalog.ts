@@ -144,12 +144,49 @@ interface ResolvedCandidate {
   genre: string;
 }
 
-/** Resolve a {title, artist} pair to Spotify metadata + the best available preview URL. */
-async function resolveCandidate(candidate: SeedCandidate): Promise<ResolvedCandidate | null> {
-  const results = await searchTracks(`${candidate.title} ${candidate.artist}`, 1).catch(() => []);
-  if (!results || results.length === 0) return null;
+type ResolveOutcome =
+  | { kind: "resolved"; candidate: ResolvedCandidate }
+  | { kind: "no-match" } // Spotify genuinely returned zero results
+  | { kind: "error"; message: string }; // the search call itself failed (rate limit, network, etc.)
 
-  const t = results[0];
+function sleep(ms: number): Promise<void> {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
+const MAX_SEARCH_RETRIES = 4;
+
+/**
+ * Search Spotify with retry/backoff on rate-limit (429) responses.
+ * searchTracks() throws `Spotify search failed: ${status}` on any non-2xx,
+ * so we detect 429 via the message rather than needing spotify.ts to expose
+ * a richer error type.
+ */
+async function searchWithRetry(query: string): Promise<{ results: any[] } | { error: string }> {
+  for (let attempt = 0; attempt <= MAX_SEARCH_RETRIES; attempt++) {
+    try {
+      const results = await searchTracks(query, 1);
+      return { results: results ?? [] };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const isRateLimited = message.includes("429");
+      if (isRateLimited && attempt < MAX_SEARCH_RETRIES) {
+        const backoffMs = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s, 8s
+        await sleep(backoffMs);
+        continue;
+      }
+      return { error: message };
+    }
+  }
+  return { error: "exhausted retries" };
+}
+
+/** Resolve a {title, artist} pair to Spotify metadata + the best available preview URL. */
+async function resolveCandidate(candidate: SeedCandidate): Promise<ResolveOutcome> {
+  const outcome = await searchWithRetry(`${candidate.title} ${candidate.artist}`);
+  if ("error" in outcome) return { kind: "error", message: outcome.error };
+  if (outcome.results.length === 0) return { kind: "no-match" };
+
+  const t = outcome.results[0];
   const isrc: string | null = t.external_ids?.isrc ?? null;
   let previewUrl: string | null = t.preview_url ?? null;
 
@@ -159,16 +196,19 @@ async function resolveCandidate(candidate: SeedCandidate): Promise<ResolvedCandi
   }
 
   return {
-    spotifyId: t.id,
-    title: t.name,
-    artist: t.artists.map((a: { name: string }) => a.name).join(", "),
-    album: t.album?.name ?? null,
-    durationMs: t.duration_ms ?? null,
-    artworkUrl: t.album?.images?.[0]?.url ?? null,
-    popularity: t.popularity ?? null,
-    isrc,
-    previewUrl,
-    genre: candidate.genre,
+    kind: "resolved",
+    candidate: {
+      spotifyId: t.id,
+      title: t.name,
+      artist: t.artists.map((a: { name: string }) => a.name).join(", "),
+      album: t.album?.name ?? null,
+      durationMs: t.duration_ms ?? null,
+      artworkUrl: t.album?.images?.[0]?.url ?? null,
+      popularity: t.popularity ?? null,
+      isrc,
+      previewUrl,
+      genre: candidate.genre,
+    },
   };
 }
 
@@ -251,6 +291,7 @@ async function analyzeAndStore(
 interface Stats {
   candidatePool: number;
   noSpotifyMatch: number;
+  resolutionErrors: number; // search call itself failed (rate limit, network, etc.) -- NOT the same as "doesn't exist on Spotify"
   alreadyAnalyzed: number;
   noPreview: number;
   toAnalyze: number;
@@ -268,6 +309,7 @@ function printEstimate(stats: Stats, args: Args): void {
   console.log("\n=== DRY RUN ESTIMATE (no writes, no /analyze calls were made) ===");
   console.log(`Candidate pool (deduped):     ${stats.candidatePool}`);
   console.log(`  no Spotify match:           ${stats.noSpotifyMatch}`);
+  console.log(`  resolution errors (retry-exhausted, NOT "no match" -- rerun to pick these back up): ${stats.resolutionErrors}`);
   console.log(`  already analyzed (skip):    ${stats.alreadyAnalyzed}`);
   console.log(`  no preview URL available:   ${stats.noPreview}`);
   console.log(`  --> would analyze:          ${stats.toAnalyze}`);
@@ -291,13 +333,20 @@ function printEstimate(stats: Stats, args: Args): void {
 
 function printFinalReport(stats: Stats): void {
   console.log("\n=== SEED RUN COMPLETE ===");
-  console.log(`Analyzed successfully: ${stats.analyzed}`);
-  console.log(`Failed:                ${stats.failed}`);
+  console.log(`Analyzed successfully:  ${stats.analyzed}`);
+  console.log(`Failed:                 ${stats.failed}`);
   console.log(`Skipped (already done): ${stats.alreadyAnalyzed}`);
   console.log(`Skipped (no preview):   ${stats.noPreview}`);
   console.log(`Skipped (no match):     ${stats.noSpotifyMatch}`);
+  console.log(`Resolution errors:      ${stats.resolutionErrors} (rerun to retry these -- not the same as "no match")`);
   console.log("==========================\n");
 }
+
+// Fixed pacing gap between sequential Spotify search calls. Spotify's
+// Client Credentials rate limit isn't officially published, but hammering
+// ~2,700 candidates with zero delay reliably triggers 429s partway through
+// a real run -- this keeps us comfortably under it.
+const SEARCH_PACING_MS = 120;
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
@@ -313,6 +362,7 @@ async function main(): Promise<void> {
   const stats: Stats = {
     candidatePool: candidates.length,
     noSpotifyMatch: 0,
+    resolutionErrors: 0,
     alreadyAnalyzed: 0,
     noPreview: 0,
     toAnalyze: 0,
@@ -321,14 +371,27 @@ async function main(): Promise<void> {
   };
 
   const toProcess: ResolvedCandidate[] = [];
+  const errorSamples: string[] = [];
 
-  console.log(`[seed] Resolving ${candidates.length} candidates against Spotify (read-only)...`);
+  console.log(`[seed] Resolving ${candidates.length} candidates against Spotify (read-only, paced ${SEARCH_PACING_MS}ms apart)...`);
   for (const candidate of candidates) {
-    const resolved = await resolveCandidate(candidate);
-    if (!resolved) {
+    const outcome = await resolveCandidate(candidate);
+    await sleep(SEARCH_PACING_MS);
+
+    if (outcome.kind === "error") {
+      stats.resolutionErrors++;
+      if (errorSamples.length < 5 && !errorSamples.includes(outcome.message)) {
+        errorSamples.push(outcome.message);
+      }
+      continue;
+    }
+
+    if (outcome.kind === "no-match") {
       stats.noSpotifyMatch++;
       continue;
     }
+
+    const resolved = outcome.candidate;
 
     const { data: existing } = await supabase
       .from("track_features")
@@ -349,6 +412,11 @@ async function main(): Promise<void> {
 
     stats.toAnalyze++;
     toProcess.push(resolved);
+  }
+
+  if (errorSamples.length > 0) {
+    console.log(`\n[seed] Sample resolution errors (${stats.resolutionErrors} total, retry-exhausted):`);
+    errorSamples.forEach((e) => console.log(`  - ${e}`));
   }
 
   if (args.dryRun) {

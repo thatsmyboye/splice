@@ -148,7 +148,7 @@ export async function getChartTracks(
     });
 
     if (!res.ok) {
-      console.warn(`[apple-music] charts fetch returned ${res.status}`);
+      console.warn(`[apple-music] charts fetch for storefront "${storefront}" returned ${res.status}`);
       return [];
     }
 
