@@ -373,8 +373,11 @@ async function main(): Promise<void> {
   const toProcess: ResolvedCandidate[] = [];
   const errorSamples: string[] = [];
 
+  const PROGRESS_EVERY = 50;
+  const startedAt = Date.now();
   console.log(`[seed] Resolving ${candidates.length} candidates against Spotify (read-only, paced ${SEARCH_PACING_MS}ms apart)...`);
-  for (const candidate of candidates) {
+  for (let i = 0; i < candidates.length; i++) {
+    const candidate = candidates[i];
     const outcome = await resolveCandidate(candidate);
     await sleep(SEARCH_PACING_MS);
 
@@ -383,35 +386,35 @@ async function main(): Promise<void> {
       if (errorSamples.length < 5 && !errorSamples.includes(outcome.message)) {
         errorSamples.push(outcome.message);
       }
-      continue;
-    }
-
-    if (outcome.kind === "no-match") {
+    } else if (outcome.kind === "no-match") {
       stats.noSpotifyMatch++;
-      continue;
+    } else {
+      const resolved = outcome.candidate;
+
+      const { data: existing } = await supabase
+        .from("track_features")
+        .select("spotify_id, source")
+        .eq("spotify_id", resolved.spotifyId)
+        .neq("source", "synthetic")
+        .maybeSingle();
+
+      if (existing) {
+        stats.alreadyAnalyzed++;
+      } else if (!resolved.previewUrl) {
+        stats.noPreview++;
+      } else {
+        stats.toAnalyze++;
+        toProcess.push(resolved);
+      }
     }
 
-    const resolved = outcome.candidate;
-
-    const { data: existing } = await supabase
-      .from("track_features")
-      .select("spotify_id, source")
-      .eq("spotify_id", resolved.spotifyId)
-      .neq("source", "synthetic")
-      .maybeSingle();
-
-    if (existing) {
-      stats.alreadyAnalyzed++;
-      continue;
+    if ((i + 1) % PROGRESS_EVERY === 0 || i + 1 === candidates.length) {
+      const elapsedS = ((Date.now() - startedAt) / 1000).toFixed(0);
+      console.log(
+        `[seed] ...${i + 1}/${candidates.length} resolved (${elapsedS}s elapsed, ` +
+          `${stats.toAnalyze} analyzable, ${stats.resolutionErrors} errors so far)`
+      );
     }
-
-    if (!resolved.previewUrl) {
-      stats.noPreview++;
-      continue;
-    }
-
-    stats.toAnalyze++;
-    toProcess.push(resolved);
   }
 
   if (errorSamples.length > 0) {

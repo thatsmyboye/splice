@@ -15,6 +15,10 @@ import crypto from "node:crypto";
 
 const AM_API_BASE = "https://api.music.apple.com/v1";
 
+// See lib/spotify.ts's FETCH_TIMEOUT_MS -- same rationale: an untimed-out
+// fetch can hang a caller indefinitely on a single stalled request.
+const FETCH_TIMEOUT_MS = 10_000;
+
 // Tokens are valid up to 6 months. We cache per-process for 12 hours.
 const TOKEN_TTL_MS = 12 * 60 * 60 * 1000;
 
@@ -106,6 +110,7 @@ export async function getSongByISRC(
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
       next: { revalidate: 86_400 },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {
@@ -145,6 +150,7 @@ export async function getChartTracks(
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${token}` },
       next: { revalidate: 3_600 },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {
