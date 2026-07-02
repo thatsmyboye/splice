@@ -7,6 +7,13 @@
 const SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token";
 const SPOTIFY_API_BASE = "https://api.spotify.com/v1";
 
+// None of these fetches previously had a timeout, so a single stalled
+// request (dropped connection, no response ever received) would hang the
+// calling code indefinitely rather than throwing -- fine for a single
+// live request, but fatal for anything making many sequential calls (e.g.
+// scripts/seed-catalog.ts), where it looks exactly like a dead process.
+const FETCH_TIMEOUT_MS = 10_000;
+
 let cachedToken: { token: string; expiresAt: number } | null = null;
 
 async function getAccessToken(): Promise<string> {
@@ -26,6 +33,7 @@ async function getAccessToken(): Promise<string> {
     },
     body: "grant_type=client_credentials",
     cache: "no-store",
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -48,6 +56,7 @@ export async function searchTracks(query: string, limit = 10) {
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     next: { revalidate: 300 },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
@@ -65,6 +74,7 @@ export async function getTrack(spotifyId: string) {
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     next: { revalidate: 3600 },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!response.ok) {
