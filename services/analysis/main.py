@@ -2,30 +2,86 @@
 Splice Analysis Service
 =======================
 FastAPI microservice for audio analysis.
-Accepts a 30-second audio URL (Spotify preview), runs librosa + essentia,
-returns segment-level features and a 128-dim normalized embedding vector.
+
+Given an audio URL (a 30s preview, or a full-length track supplied by the
+user), it returns two things:
+
+  1. **Moment embeddings** — a sliding window of 512-dim CLAP vectors, one per
+     ~10s of audio. These are what pgvector actually searches, and because each
+     row carries its own [start_s, end_s), a match *is* a timestamp. The
+     previous design emitted a single 128-dim vector per track, which made
+     moment-level matching impossible and forced the API to invent a timestamp
+     for every result.
+
+  2. **Display metadata** — key, BPM, time signature, per-section chords, from
+     librosa + essentia. This never feeds the search; it's what the result
+     cards show.
 
 Deployed on Railway via Docker.
 Authentication: X-Service-Secret header (shared secret with web app).
 """
 
-import os
+import asyncio
 import io
 import logging
+import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
-import httpx
-import numpy as np
-import librosa
 import essentia.standard as ess
-from fastapi import FastAPI, HTTPException, Header, Depends
+import httpx
+import librosa
+import numpy as np
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+import clap_embedder
+from clap_embedder import CLAP_SAMPLE_RATE, EMBEDDING_DIM
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Splice Analysis Service", version="2.0.0")
+SERVICE_SECRET = os.environ.get("ANALYSIS_SERVICE_SECRET", "")
+if not SERVICE_SECRET:
+    raise RuntimeError("ANALYSIS_SERVICE_SECRET env var is required")
+
+# Sample rate for the librosa/essentia display-metadata pass. Lower than CLAP's
+# 48 kHz because chroma/MFCC/beat tracking gain nothing from the extra
+# bandwidth and cost real CPU time at higher rates.
+DSP_SAMPLE_RATE = 22050
+N_MFCC = 13
+
+# Identifies which embedding space a stored vector belongs to. Bump this
+# whenever the checkpoint or window geometry changes — vectors from different
+# values are NOT comparable, and silently mixing two spaces is exactly the bug
+# that made AcousticBrainz-sourced matches meaningless.
+EMBEDDING_MODEL_ID = "clap-music-audioset-v1"
+
+# Analysis is CPU-bound and the service runs a single worker (the CLAP
+# checkpoint is ~2 GB resident, so forking workers multiplies that). This
+# bounds how many analyses run at once; excess requests queue rather than
+# thrashing the box.
+ANALYSIS_CONCURRENCY = int(os.environ.get("ANALYSIS_CONCURRENCY", "2"))
+_analysis_semaphore: Optional[asyncio.Semaphore] = None
+
+# Full-length uploads are much larger than a 30s preview. Bounded so a single
+# request can't exhaust memory.
+MAX_AUDIO_BYTES = int(os.environ.get("MAX_AUDIO_BYTES", str(60 * 1024 * 1024)))
+AUDIO_FETCH_TIMEOUT_S = float(os.environ.get("AUDIO_FETCH_TIMEOUT_S", "60"))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the checkpoint at startup rather than on first request, so a cold
+    # instance fails loudly at boot instead of timing out someone's search.
+    global _analysis_semaphore
+    _analysis_semaphore = asyncio.Semaphore(ANALYSIS_CONCURRENCY)
+    await asyncio.to_thread(clap_embedder.load_model)
+    yield
+
+
+app = FastAPI(title="Splice Analysis Service", version="3.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,21 +90,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SERVICE_SECRET = os.environ.get("ANALYSIS_SERVICE_SECRET", "")
-if not SERVICE_SECRET:
-    raise RuntimeError("ANALYSIS_SERVICE_SECRET env var is required")
-
-EMBEDDING_DIM = 128
-SAMPLE_RATE = 22050
-N_MFCC = 13
-N_CHROMA = 12
-
-# Circle-of-fifths position map (enharmonic equivalents share a slot)
-_COF: dict[str, int] = {
-    "C": 0, "G": 1, "D": 2, "A": 3, "E": 4, "B": 5,
-    "F#": 6, "Gb": 6, "C#": 7, "Db": 7, "Ab": 8,
-    "Eb": 9, "Bb": 10, "F": 11,
-}
 
 # ============================================================
 # Chord template library (built once at module load)
@@ -97,14 +138,10 @@ def detect_chord(chroma_vector: np.ndarray) -> tuple[str, float]:
     return best_label, round(best_score, 4)
 
 
-# ============================================================
-# Time signature detection
-# ============================================================
-
 def detect_time_signature(y: np.ndarray, sr: int, tempo: float) -> int:
     """Detect whether the track is in 3/4 or 4/4 time.
 
-    Uses onset-strength autocorrelation: compares energy at 3× vs 4× the
+    Uses onset-strength autocorrelation: compares energy at 3x vs 4x the
     beat period. A 5% bias toward 4/4 encodes the prior that most music is
     in duple meter.
 
@@ -139,21 +176,43 @@ def verify_secret(x_service_secret: str = Header(...)):
 # ============================================================
 
 class AnalyzeRequest(BaseModel):
-    preview_url: str          # Spotify 30s preview MP3 URL
-    spotify_id: str           # for logging/caching reference
+    # `preview_url` is the historical name; `audio_url` is the same field for
+    # full-length sources. Exactly one must be present.
+    preview_url: Optional[str] = None
+    audio_url: Optional[str] = None
+    spotify_id: str
     mbid: Optional[str] = None
+
+    def resolved_url(self) -> str:
+        url = self.audio_url or self.preview_url
+        if not url:
+            raise HTTPException(status_code=422, detail="preview_url or audio_url is required")
+        return url
 
 
 class SegmentFeatures(BaseModel):
+    """Per-section display metadata. Not used for search.
+
+    The chroma/MFCC arrays the previous version stored here existed only so the
+    old /embed-window endpoint could reconstruct a query vector from stored
+    features. Query vectors now come from the persisted window embeddings
+    directly, so those arrays are dropped — they were the bulk of the JSONB
+    payload and nothing reads them.
+    """
     start_s: float
     duration_s: float
-    energy: float             # RMS energy, normalized 0–1
+    energy: float             # RMS energy, normalized 0-1
     loudness_db: float        # dB, onset loudness
-    spectral_centroid: float  # Hz, normalized 0–1
-    chroma_vector: list[float]   # 12-dim chroma (pitch class profile)
-    mfcc_means: list[float]      # 13-dim MFCC means
-    chord_label: str             # e.g. 'Am', 'F#', 'N' (no chord / silence)
-    chord_confidence: float      # 0.0–1.0, template match score
+    spectral_centroid: float  # Hz, normalized 0-1
+    chord_label: str          # e.g. 'Am', 'F#', 'N' (no chord / silence)
+    chord_confidence: float   # 0.0-1.0, template match score
+
+
+class MomentWindow(BaseModel):
+    """One searchable moment: a time span and its CLAP embedding."""
+    start_s: float
+    end_s: float
+    embedding: list[float]    # 512-dim, L2-normalized
 
 
 class TrackAnalysis(BaseModel):
@@ -163,36 +222,26 @@ class TrackAnalysis(BaseModel):
     bpm: float
     key_name: str             # e.g. 'C', 'F#'
     key_mode: str             # 'major' | 'minor'
-    key_confidence: float     # 0.0–1.0, Essentia KeyExtractor strength
+    key_confidence: float     # 0.0-1.0, Essentia KeyExtractor strength
     time_signature: int       # 3 or 4
-    harmonic_rhythm: float    # chord changes/sec, normalized 0–1
-    danceability: float       # 0.0–1.0
+    harmonic_rhythm: float    # chord changes/sec, normalized 0-1
+    danceability: float       # 0.0-1.0
     dynamic_complexity: float
     segments: list[SegmentFeatures]
-    embedding: list[float]    # 128-dim normalized vector (v2 layout)
+    embedding_model: str      # which space `windows` live in
+    embedding_dim: int
+    windows: list[MomentWindow]
 
 
-class EmbedRequest(BaseModel):
-    """Convert a pre-existing feature dict to an embedding vector."""
-    features: dict
-
-
-class EmbedWindowRequest(BaseModel):
-    """Compute a 128-dim query embedding for a selected time window within a track."""
-    segments: list[dict]           # Full segments array from track_features (v2.0)
-    timestamp_s: float             # Start of selected window / single-mark timestamp
-    timestamp_end_s: Optional[float] = None  # End of window; None = single-mark
-    bpm: float = 120.0
-    key_name: str = "C"
-    key_mode: str = "major"
-    time_signature: int = 4
-    harmonic_rhythm: float = 0.0
-    danceability: float = 0.5
-    dynamic_complexity: float = 0.0
+class EmbedTextRequest(BaseModel):
+    """Embed a natural-language moment description into the CLAP space."""
+    text: str
 
 
 class EmbedResponse(BaseModel):
     embedding: list[float]
+    embedding_model: str
+    embedding_dim: int
 
 
 # ============================================================
@@ -202,16 +251,27 @@ class EmbedResponse(BaseModel):
 async def fetch_audio_bytes(url: str) -> bytes:
     """Download audio from URL. Raises HTTPException on failure."""
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            response = await client.get(url, follow_redirects=True)
-            response.raise_for_status()
-            return response.content
+        async with httpx.AsyncClient(timeout=AUDIO_FETCH_TIMEOUT_S) as client:
+            async with client.stream("GET", url, follow_redirects=True) as response:
+                response.raise_for_status()
+
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > MAX_AUDIO_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"Audio exceeds {MAX_AUDIO_BYTES // (1024 * 1024)}MB limit",
+                        )
+                    chunks.append(chunk)
+                return b"".join(chunks)
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="Audio URL fetch timed out")
     except httpx.HTTPStatusError as e:
         raise HTTPException(
             status_code=502,
-            detail=f"Audio URL returned {e.response.status_code}"
+            detail=f"Audio URL returned {e.response.status_code}",
         )
 
 
@@ -219,24 +279,15 @@ async def fetch_audio_bytes(url: str) -> bytes:
 # Feature extraction
 # ============================================================
 
-def extract_features(audio_bytes: bytes, spotify_id: str) -> TrackAnalysis:
-    """
-    Core analysis pipeline.
-    1. Load audio via librosa (resampled to 22050 Hz mono)
-    2. Detect sections (structural segmentation)
-    3. Extract per-segment features including chord detection
-    4. Run essentia for tonal/rhythm analysis
-    5. Detect time signature via onset autocorrelation
-    6. Build 128-dim v2 embedding
-    """
+def extract_display_metadata(y_dsp: np.ndarray, sr: int, duration_s: float):
+    """librosa + essentia pass: key, BPM, time signature, per-section chords.
 
-    # --- Load audio ---
-    y, sr = librosa.load(io.BytesIO(audio_bytes), sr=SAMPLE_RATE, mono=True)
-    duration_s = librosa.get_duration(y=y, sr=sr)
-
-    # --- Structural segmentation ---
+    Returns (segments, track_level_dict). Never raises for individual essentia
+    algorithms — each degrades to a neutral default so a single failing
+    extractor can't sink the whole analysis.
+    """
     boundaries = librosa.segment.agglomerative(
-        librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC),
+        librosa.feature.mfcc(y=y_dsp, sr=sr, n_mfcc=N_MFCC),
         k=min(8, max(2, int(duration_s / 5)))
     )
     boundary_times = librosa.frames_to_time(boundaries, sr=sr)
@@ -244,267 +295,108 @@ def extract_features(audio_bytes: bytes, spotify_id: str) -> TrackAnalysis:
     section_starts = np.concatenate([[0.0], boundary_times])
     section_ends = np.concatenate([boundary_times, [duration_s]])
 
-    # --- Track-level features via librosa ---
-    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    tempo, _ = librosa.beat.beat_track(y=y_dsp, sr=sr)
     bpm = float(np.atleast_1d(tempo)[0])
 
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-    mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=N_MFCC)
+    chroma = librosa.feature.chroma_cqt(y=y_dsp, sr=sr)
 
-    spec_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+    spec_centroid = librosa.feature.spectral_centroid(y=y_dsp, sr=sr)[0]
     spec_centroid_norm = (spec_centroid - spec_centroid.min()) / (
         spec_centroid.max() - spec_centroid.min() + 1e-8
     )
 
-    rms = librosa.feature.rms(y=y)[0]
+    rms = librosa.feature.rms(y=y_dsp)[0]
     rms_norm = (rms - rms.min()) / (rms.max() - rms.min() + 1e-8)
 
-    # --- Per-segment feature extraction ---
     segments: list[SegmentFeatures] = []
-    all_segment_vectors: list[np.ndarray] = []
-
     for start, end in zip(section_starts, section_ends):
         start_frame = librosa.time_to_frames(start, sr=sr)
-        end_frame = librosa.time_to_frames(end, sr=sr)
-
-        end_frame = min(end_frame, chroma.shape[1] - 1)
+        end_frame = min(librosa.time_to_frames(end, sr=sr), chroma.shape[1] - 1)
         if start_frame >= end_frame:
             continue
 
         seg_chroma_arr = chroma[:, start_frame:end_frame].mean(axis=1)
-        seg_chroma = seg_chroma_arr.tolist()
-        seg_mfcc = mfccs[:, start_frame:end_frame].mean(axis=1).tolist()
-        seg_energy = float(rms_norm[start_frame:end_frame].mean())
-        seg_centroid = float(spec_centroid_norm[start_frame:end_frame].mean())
-
-        seg_y = y[
+        seg_y = y_dsp[
             librosa.time_to_samples(start, sr=sr):
             librosa.time_to_samples(end, sr=sr)
         ]
-        loudness_db = float(librosa.amplitude_to_db(
-            np.abs(seg_y).mean() + 1e-8
-        ))
-
         chord_label, chord_confidence = detect_chord(seg_chroma_arr)
 
-        seg_features = SegmentFeatures(
+        segments.append(SegmentFeatures(
             start_s=float(start),
             duration_s=float(end - start),
-            energy=seg_energy,
-            loudness_db=loudness_db,
-            spectral_centroid=seg_centroid,
-            chroma_vector=seg_chroma,
-            mfcc_means=seg_mfcc,
+            energy=float(rms_norm[start_frame:end_frame].mean()),
+            loudness_db=float(librosa.amplitude_to_db(np.abs(seg_y).mean() + 1e-8)),
+            spectral_centroid=float(spec_centroid_norm[start_frame:end_frame].mean()),
             chord_label=chord_label,
             chord_confidence=chord_confidence,
-        )
-        segments.append(seg_features)
+        ))
 
-        seg_vector = np.array(
-            [seg_energy, seg_centroid, loudness_db] + seg_chroma + seg_mfcc
-        )
-        all_segment_vectors.append(seg_vector)
+    y32 = y_dsp.astype(np.float32)
 
-    # --- Essentia tonal + rhythm analysis ---
-    key_extractor = ess.KeyExtractor()
     try:
-        key, scale, strength = key_extractor(y.astype(np.float32))
-        key_name = key
-        key_mode = scale  # 'major' or 'minor'
+        key_name, key_mode, strength = ess.KeyExtractor()(y32)
         key_confidence = float(np.clip(strength, 0.0, 1.0))
     except Exception:
-        key_name = "C"
-        key_mode = "major"
-        key_confidence = 0.0  # unknown — zero confidence suppresses key-boost scoring
+        # Zero confidence suppresses any downstream key-based scoring.
+        key_name, key_mode, key_confidence = "C", "major", 0.0
 
     try:
-        danceability_algo = ess.Danceability(sampleRate=SAMPLE_RATE)
-        danceability_val, _ = danceability_algo(y.astype(np.float32))
+        danceability_val, _ = ess.Danceability(sampleRate=sr)(y32)
         danceability = float(np.clip(danceability_val / 3.0, 0.0, 1.0))
     except Exception:
         danceability = 0.5
 
     try:
-        dynamic_complexity_algo = ess.DynamicComplexity(sampleRate=SAMPLE_RATE)
-        dynamic_complexity_val, _ = dynamic_complexity_algo(y.astype(np.float32))
+        dynamic_complexity_val, _ = ess.DynamicComplexity(sampleRate=sr)(y32)
         dynamic_complexity = float(dynamic_complexity_val)
     except Exception:
         dynamic_complexity = 0.0
 
-    # --- Time signature detection ---
-    time_signature = detect_time_signature(y, sr, bpm)
+    chord_seq = [s.chord_label for s in segments]
+    chord_changes = sum(1 for a, b in zip(chord_seq, chord_seq[1:]) if a != b)
+    harmonic_rhythm = float(np.clip(chord_changes / max(duration_s, 1.0) / 2.0, 0.0, 1.0))
 
-    # --- Harmonic rhythm: chord changes per second, normalized to 0–1 ---
-    chord_labels_seq = [s.chord_label for s in segments]
-    chord_changes = sum(
-        1 for a, b in zip(chord_labels_seq, chord_labels_seq[1:]) if a != b
-    )
-    harmonic_rhythm = float(np.clip(
-        chord_changes / max(duration_s, 1.0) / 2.0,
-        0.0, 1.0
-    ))
+    return segments, {
+        "bpm": bpm,
+        "key_name": key_name,
+        "key_mode": key_mode,
+        "key_confidence": key_confidence,
+        "time_signature": detect_time_signature(y_dsp, sr, bpm),
+        "harmonic_rhythm": harmonic_rhythm,
+        "danceability": danceability,
+        "dynamic_complexity": dynamic_complexity,
+    }
 
-    # --- Build 128-dim v2 embedding ---
-    embedding = build_embedding(
-        segment_vectors=all_segment_vectors,
-        bpm=bpm,
-        danceability=danceability,
-        dynamic_complexity=dynamic_complexity,
-        global_chroma=chroma.mean(axis=1),
-        global_mfcc=mfccs.mean(axis=1),
-        key_name=key_name,
-        key_mode=key_mode,
-        time_signature=time_signature,
-        harmonic_rhythm=harmonic_rhythm,
-    )
+
+def analyze_audio(audio_bytes: bytes, spotify_id: str, mbid: Optional[str]) -> TrackAnalysis:
+    """Full pipeline: decode once, embed windows via CLAP, extract display metadata."""
+    # Decode at CLAP's rate, then downsample for the DSP pass — decoding twice
+    # would double the most expensive part of a full-length track.
+    y, _ = librosa.load(io.BytesIO(audio_bytes), sr=CLAP_SAMPLE_RATE, mono=True)
+    duration_s = float(librosa.get_duration(y=y, sr=CLAP_SAMPLE_RATE))
+    if duration_s <= 0:
+        raise HTTPException(status_code=422, detail="Decoded audio is empty")
+
+    windows = clap_embedder.plan_windows(duration_s)
+    embeddings = clap_embedder.embed_audio_windows(y, CLAP_SAMPLE_RATE, windows)
+
+    y_dsp = librosa.resample(y, orig_sr=CLAP_SAMPLE_RATE, target_sr=DSP_SAMPLE_RATE)
+    segments, track_level = extract_display_metadata(y_dsp, DSP_SAMPLE_RATE, duration_s)
 
     return TrackAnalysis(
         spotify_id=spotify_id,
-        mbid=None,
+        mbid=mbid,
         duration_s=duration_s,
-        bpm=bpm,
-        key_name=key_name,
-        key_mode=key_mode,
-        key_confidence=key_confidence,
-        time_signature=time_signature,
-        harmonic_rhythm=harmonic_rhythm,
-        danceability=danceability,
-        dynamic_complexity=dynamic_complexity,
         segments=segments,
-        embedding=embedding.tolist(),
+        embedding_model=EMBEDDING_MODEL_ID,
+        embedding_dim=EMBEDDING_DIM,
+        windows=[
+            MomentWindow(start_s=start, end_s=end, embedding=vec.tolist())
+            for (start, end), vec in zip(windows, embeddings)
+        ],
+        **track_level,
     )
-
-
-def build_embedding(
-    segment_vectors: list[np.ndarray],
-    bpm: float,
-    danceability: float,
-    dynamic_complexity: float,
-    global_chroma: np.ndarray,
-    global_mfcc: np.ndarray,
-    key_name: str = "C",
-    key_mode: str = "major",
-    time_signature: int = 4,
-    harmonic_rhythm: float = 0.0,
-) -> np.ndarray:
-    """
-    Construct the 128-dim track embedding (v2 layout).
-
-      Dims   Count  Content
-      -----  -----  -------
-      0–11    12    Global chroma mean (pitch class profile)
-      12–24   13    Global MFCC means
-      25–36   12    Chroma variance across segments
-      37–49   13    MFCC variance across segments
-      50–111  62    SVD-PCA reduced segment matrix
-      112–113  2    Key encoding: COF position + mode
-      114–115  2    BPM (normalized) + danceability
-      116–117  2    Time signature (norm) + harmonic rhythm
-      118–127 10    Dynamic complexity + segment energy profile
-      ------  ---
-              128   total
-    """
-    parts = []
-
-    # Global chroma (12) + MFCC (13) = 25 dims
-    parts.append(_normalize(global_chroma))    # 12
-    parts.append(_normalize(global_mfcc))      # 13
-
-    if len(segment_vectors) >= 2:
-        seg_matrix = np.vstack(segment_vectors)
-
-        chroma_cols = seg_matrix[:, 3:15]
-        mfcc_cols   = seg_matrix[:, 15:28]
-        parts.append(_normalize(chroma_cols.std(axis=0)))   # 12
-        parts.append(_normalize(mfcc_cols.std(axis=0)))     # 13
-
-        # PCA reduction to 62 dims (reduced from 64 to free room for harmonic dims)
-        n_components = min(62, seg_matrix.shape[0], seg_matrix.shape[1])
-        pca_reduced = np.zeros(62)
-        pca_reduced[:n_components] = _pca_reduce(seg_matrix, n_components)
-        parts.append(_normalize(pca_reduced))               # 62
-    else:
-        parts.append(np.zeros(12))   # chroma variance
-        parts.append(np.zeros(13))   # mfcc variance
-        parts.append(np.zeros(62))   # pca
-
-    # Key encoding: circle-of-fifths position (0–1) + mode (major=1.0, minor=0.0)
-    cof_pos = _COF.get(key_name, 0) / 11.0
-    mode_float = 1.0 if key_mode == "major" else 0.0
-    parts.append(np.array([cof_pos, mode_float]))           # 2
-
-    # BPM normalized (60–200 BPM → 0–1) + danceability
-    bpm_norm = float(np.clip((bpm - 60) / 140, 0.0, 1.0))
-    parts.append(np.array([bpm_norm, float(danceability)])) # 2
-
-    # Time signature (4/4=1.0, 3/4=0.0) + harmonic rhythm
-    ts_norm = 1.0 if time_signature == 4 else 0.0
-    parts.append(np.array([ts_norm, float(harmonic_rhythm)])) # 2
-
-    # Dynamic complexity + segment energy profile (10 dims)
-    energy_features = np.zeros(10)
-    energy_features[0] = float(np.clip(dynamic_complexity / 10.0, 0.0, 1.0))
-    if len(segment_vectors) > 0:
-        energies = np.array([v[0] for v in segment_vectors])
-        energy_features[1] = float(energies.mean())
-        energy_features[2] = float(energies.std())
-    parts.append(energy_features)                           # 10
-
-    embedding = np.concatenate(parts)
-
-    # Ensure exactly 128 dims (truncate or pad)
-    if len(embedding) > EMBEDDING_DIM:
-        embedding = embedding[:EMBEDDING_DIM]
-    elif len(embedding) < EMBEDDING_DIM:
-        embedding = np.pad(embedding, (0, EMBEDDING_DIM - len(embedding)))
-
-    # L2 normalize for cosine similarity
-    norm = np.linalg.norm(embedding)
-    if norm > 1e-8:
-        embedding = embedding / norm
-
-    return embedding
-
-
-def _normalize(arr: np.ndarray) -> np.ndarray:
-    """Min-max normalize to [0, 1]."""
-    mn, mx = arr.min(), arr.max()
-    if mx - mn < 1e-8:
-        return np.zeros_like(arr)
-    return (arr - mn) / (mx - mn)
-
-
-def _pca_reduce(matrix: np.ndarray, n_components: int) -> np.ndarray:
-    """Simple PCA via SVD. Returns first n_components principal components."""
-    centered = matrix - matrix.mean(axis=0)
-    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
-    projected = centered @ Vt[:n_components].T
-    return projected.mean(axis=0)
-
-
-def moment_descriptor_to_embedding(descriptor: dict) -> np.ndarray:
-    """
-    Convert a Claude MomentDescriptor (from /api/interpret) into a 64-dim vector
-    for moment-to-moment matching in Phase 2.
-    """
-    keys = [
-        "energy_profile", "timbral_character", "harmonic_tension",
-        "structural_position", "textural_density", "emotional_arc"
-    ]
-    base = np.array([float(descriptor.get(k, 0.5)) for k in keys])
-
-    expanded = np.zeros(64)
-    for i, val in enumerate(base):
-        for j in range(10):
-            idx = i * 10 + j
-            if idx < 64:
-                expanded[idx] = val * np.cos(j * np.pi * val)
-
-    norm = np.linalg.norm(expanded)
-    if norm > 1e-8:
-        expanded = expanded / norm
-
-    return expanded
 
 
 # ============================================================
@@ -513,7 +405,13 @@ def moment_descriptor_to_embedding(descriptor: dict) -> np.ndarray:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {
+        "status": "ok",
+        "version": "3.0.0",
+        "embedding_model": EMBEDDING_MODEL_ID,
+        "embedding_dim": EMBEDDING_DIM,
+        "model_loaded": clap_embedder.is_loaded(),
+    }
 
 
 @app.post("/analyze", response_model=TrackAnalysis)
@@ -521,114 +419,112 @@ async def analyze(
     request: AnalyzeRequest,
     _: str = Depends(verify_secret),
 ):
-    """
-    Main analysis endpoint.
-    Fetches audio from preview_url, runs librosa + essentia, returns features.
-    Typical latency: 3–8 seconds for a 30s preview.
-    """
-    logger.info(f"Analyzing track: {request.spotify_id}")
+    """Fetch audio, embed its moment windows, and extract display metadata.
 
-    audio_bytes = await fetch_audio_bytes(request.preview_url)
+    Latency scales with duration: ~5-10s for a 30s preview, proportionally
+    longer for a full-length upload.
+    """
+    url = request.resolved_url()
+    logger.info("Analyzing track: %s", request.spotify_id)
 
-    try:
-        analysis = extract_features(audio_bytes, request.spotify_id)
-    except Exception as e:
-        logger.error(f"Analysis failed for {request.spotify_id}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    audio_bytes = await fetch_audio_bytes(url)
+
+    assert _analysis_semaphore is not None  # set during lifespan startup
+    async with _analysis_semaphore:
+        try:
+            analysis = await asyncio.to_thread(
+                analyze_audio, audio_bytes, request.spotify_id, request.mbid
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Analysis failed for %s: %s", request.spotify_id, e, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
     logger.info(
-        f"Analysis complete for {request.spotify_id}: "
-        f"{len(analysis.segments)} segments, {analysis.bpm:.1f} BPM, "
-        f"key={analysis.key_name} {analysis.key_mode}, "
-        f"time_sig={analysis.time_signature}/4"
+        "Analysis complete for %s: %d windows, %d sections, %.1f BPM, key=%s %s, time_sig=%d/4",
+        request.spotify_id, len(analysis.windows), len(analysis.segments),
+        analysis.bpm, analysis.key_name, analysis.key_mode, analysis.time_signature,
     )
     return analysis
 
 
-@app.post("/embed", response_model=EmbedResponse)
-async def embed(
-    request: EmbedRequest,
+@app.post("/analyze-upload", response_model=TrackAnalysis)
+async def analyze_upload(
+    file: UploadFile = File(...),
+    spotify_id: str = Form(...),
+    mbid: Optional[str] = Form(None),
     _: str = Depends(verify_secret),
 ):
-    """Convert a MomentDescriptor dict to a 64-dim embedding vector."""
-    try:
-        embedding = moment_descriptor_to_embedding(request.features)
-        return EmbedResponse(embedding=embedding.tolist())
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Embedding failed: {str(e)}")
+    """Analyze a user-supplied audio file streamed in as multipart form data.
 
+    This is the full-length path. A 30s preview only ever covers a fraction of
+    a track, so a moment the user marked at 3:40 could never be the audio that
+    got analyzed — the timestamp they picked and the audio we embedded were
+    different things entirely. An uploaded file removes that mismatch.
 
-@app.post("/embed-window", response_model=EmbedResponse)
-async def embed_window(
-    request: EmbedWindowRequest,
-    _: str = Depends(verify_secret),
-):
+    The bytes are held in memory for the duration of the request and never
+    written to disk or forwarded to storage. Nothing about the audio survives
+    the response except the derived embeddings.
     """
-    Compute a 128-dim query embedding for a selected time window.
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(1024 * 1024):
+        total += len(chunk)
+        if total > MAX_AUDIO_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Audio exceeds {MAX_AUDIO_BYTES // (1024 * 1024)}MB limit",
+            )
+        chunks.append(chunk)
 
-    Filters the stored segment array to segments overlapping the requested
-    window, then runs the same build_embedding() pipeline used during full
-    track analysis. This produces a query vector in the same space as the
-    catalog, making the pgvector search moment-aware rather than track-level.
+    if total == 0:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty")
 
-    For a single-mark timestamp, the containing segment (or nearest segment)
-    is used. Falls back to all segments if no window segments are found.
-    """
-    all_segs = request.segments
-    if not all_segs:
-        raise HTTPException(status_code=400, detail="No segments provided")
+    audio_bytes = b"".join(chunks)
+    chunks.clear()
 
-    ts = request.timestamp_s
-    te = request.timestamp_end_s
+    logger.info("Analyzing upload for %s (%.1f MB)", spotify_id, total / (1024 * 1024))
 
-    if te is not None and te > ts:
-        # Window: all segments that overlap [ts, te)
-        window_segs = [
-            s for s in all_segs
-            if s["start_s"] < te and (s["start_s"] + s.get("duration_s", 0.0)) > ts
-        ]
-    else:
-        # Single mark: segment containing ts, or nearest segment
-        containing = [
-            s for s in all_segs
-            if s["start_s"] <= ts < (s["start_s"] + s.get("duration_s", 0.0))
-        ]
-        window_segs = containing if containing else [
-            min(all_segs, key=lambda s: abs(s["start_s"] - ts))
-        ]
+    assert _analysis_semaphore is not None  # set during lifespan startup
+    async with _analysis_semaphore:
+        try:
+            analysis = await asyncio.to_thread(analyze_audio, audio_bytes, spotify_id, mbid)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Upload analysis failed for %s: %s", spotify_id, e, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
 
-    if not window_segs:
-        window_segs = all_segs
-
-    seg_vectors: list[np.ndarray] = []
-    chroma_arrays: list[np.ndarray] = []
-    mfcc_arrays: list[np.ndarray] = []
-
-    for s in window_segs:
-        chroma = np.array(s.get("chroma_vector", [0.0] * N_CHROMA), dtype=float)
-        mfcc = np.array(s.get("mfcc_means", [0.0] * N_MFCC), dtype=float)
-        energy = float(s.get("energy", 0.0))
-        centroid = float(s.get("spectral_centroid", 0.0))
-        loudness = float(s.get("loudness_db", -60.0))
-        # Segment vector layout matches build_embedding() expectation:
-        # index 0=energy, 1=centroid, 2=loudness, 3:15=chroma, 15:28=mfcc
-        seg_vectors.append(np.concatenate([[energy, centroid, loudness], chroma, mfcc]))
-        chroma_arrays.append(chroma)
-        mfcc_arrays.append(mfcc)
-
-    global_chroma = np.mean(chroma_arrays, axis=0)
-    global_mfcc = np.mean(mfcc_arrays, axis=0)
-
-    embedding = build_embedding(
-        segment_vectors=seg_vectors,
-        bpm=request.bpm,
-        danceability=request.danceability,
-        dynamic_complexity=request.dynamic_complexity,
-        global_chroma=global_chroma,
-        global_mfcc=global_mfcc,
-        key_name=request.key_name,
-        key_mode=request.key_mode,
-        time_signature=request.time_signature,
-        harmonic_rhythm=request.harmonic_rhythm,
+    logger.info(
+        "Upload analysis complete for %s: %.1fs of audio, %d windows",
+        spotify_id, analysis.duration_s, len(analysis.windows),
     )
-    return EmbedResponse(embedding=embedding.tolist())
+    return analysis
+
+
+@app.post("/embed-text", response_model=EmbedResponse)
+async def embed_text(
+    request: EmbedTextRequest,
+    _: str = Depends(verify_secret),
+):
+    """Embed a moment description into the same space as the audio windows.
+
+    This is what lets a typed description ("the bit where everything drops out")
+    query the catalog directly, with no LLM in the retrieval path.
+    """
+    text = request.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="text must not be empty")
+
+    try:
+        embedding = await asyncio.to_thread(clap_embedder.embed_text, [text])
+    except Exception as e:
+        logger.error("Text embedding failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Text embedding failed: {e}")
+
+    return EmbedResponse(
+        embedding=embedding[0].tolist(),
+        embedding_model=EMBEDDING_MODEL_ID,
+        embedding_dim=EMBEDDING_DIM,
+    )

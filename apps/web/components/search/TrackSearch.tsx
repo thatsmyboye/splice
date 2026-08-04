@@ -7,6 +7,20 @@ import type { SpotifyTrack } from "@splice/types";
 import { Input } from "@/components/ui/input";
 import { Search, Music } from "lucide-react";
 
+/**
+ * Starting points for a first-time visitor.
+ *
+ * These prefill the search rather than linking to a track ID directly — the
+ * catalog gets rebuilt, and a hardcoded Spotify ID is a dead link waiting to
+ * happen. Chosen for moments that are easy to name out loud, across enough
+ * genre distance that the results are visibly different from each other.
+ */
+const EXAMPLE_QUERIES = [
+  "Take Five Dave Brubeck",
+  "Clair de Lune Debussy",
+  "Teardrop Massive Attack",
+];
+
 function escapeRegex(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -36,6 +50,7 @@ export function TrackSearch() {
   const [loading, setLoading] = useState(false);
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
+  const inputRef = useRef<HTMLInputElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout>>();
   const closeRef = useRef<ReturnType<typeof setTimeout>>();
   const requestIdRef = useRef(0);
@@ -91,6 +106,7 @@ export function TrackSearch() {
       <div className="relative">
         <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
         <Input
+          ref={inputRef}
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           onFocus={() => {
@@ -134,6 +150,28 @@ export function TrackSearch() {
           autoComplete="off"
         />
       </div>
+
+      {/* One-click way into the product. Without this the landing page is a
+          bare input, and a first-time visitor has to already know what a
+          "moment" search is for before they can try one. */}
+      {!query.trim() && (
+        <div className="mt-3 flex flex-wrap items-center justify-center gap-1.5">
+          <span className="text-xs text-muted-foreground">Try</span>
+          {EXAMPLE_QUERIES.map((example) => (
+            <button
+              key={example}
+              type="button"
+              onClick={() => {
+                setQuery(example);
+                inputRef.current?.focus();
+              }}
+              className="rounded-full border border-border bg-secondary/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:border-border/80 hover:text-foreground"
+            >
+              {example}
+            </button>
+          ))}
+        </div>
+      )}
 
       {open && (
         <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-lg shadow-xl z-50 overflow-hidden">

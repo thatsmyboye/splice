@@ -8,3 +8,11 @@ pydantic==2.8.2
 python-multipart==0.0.9
 soundfile==0.12.1
 scipy==1.13.1
+
+# CLAP embedding backend. torch is installed CPU-only from the PyTorch CPU
+# index in the Dockerfile -- the default CUDA wheels are ~2.5GB of GPU runtime
+# this service will never use.
+laion-clap==1.1.6
+torch==2.2.2
+torchaudio==2.2.2
+transformers==4.30.2
