@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { Play, Pause, Crosshair, GalleryHorizontal } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import type { MomentSelection } from "./TrackTimeline";
+import type { MomentSelection } from "./types";
 
 const MAX_WINDOW_S = 20;
 
@@ -79,11 +79,17 @@ function TimeInput({
 }
 
 interface WaveformScrubberProps {
-  previewUrl: string;
+  /**
+   * Any playable audio source: a remote preview URL, or an object URL for a
+   * file the user supplied. The scrubber derives its duration from whatever it
+   * loads, so marks always refer to the audio actually being analyzed — the
+   * component doesn't need to know which kind it got.
+   */
+  audioUrl: string;
   onMomentSelect: (selection: MomentSelection) => void;
 }
 
-export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubberProps) {
+export function WaveformScrubber({ audioUrl, onMomentSelect }: WaveformScrubberProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<any>(null);
   const [isReady, setIsReady] = useState(false);
@@ -97,7 +103,15 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
   const [windowEnd, setWindowEnd] = useState<number | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current || !previewUrl) return;
+    if (!containerRef.current || !audioUrl) return;
+
+    // Switching sources (preview -> uploaded file) tears down and rebuilds, so
+    // stale duration/position from the previous audio can't leak through.
+    setIsReady(false);
+    setCurrentTime(0);
+    setDuration(0);
+    setWindowStart(null);
+    setWindowEnd(null);
 
     import("wavesurfer.js").then(({ default: WaveSurfer }) => {
       if (!containerRef.current) return;
@@ -116,7 +130,7 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
       });
 
       wsRef.current = ws;
-      ws.load(previewUrl);
+      ws.load(audioUrl);
       ws.on("ready", () => {
         setIsReady(true);
         setDuration(ws.getDuration());
@@ -131,7 +145,7 @@ export function WaveformScrubber({ previewUrl, onMomentSelect }: WaveformScrubbe
       wsRef.current?.destroy();
       wsRef.current = null;
     };
-  }, [previewUrl]);
+  }, [audioUrl]);
 
   const togglePlay = useCallback(() => wsRef.current?.playPause(), []);
 

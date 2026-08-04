@@ -43,6 +43,8 @@ loadEnv({ path: resolve(__dirname, "../.env.local") });
 import { createClient } from "@supabase/supabase-js";
 import { searchTracks } from "../lib/spotify";
 import { getSongByISRC, getChartTracks } from "../lib/apple-music";
+import { storeAnalysis, type AnalysisResponse } from "../lib/store-analysis";
+import { EMBEDDING_MODEL_ID } from "../lib/analysis-service";
 import { CURATED_SEED_TRACKS, type SeedCandidate } from "./seed-tracklist";
 
 // Broad, deliberately non-overlapping regional spread -- diversity here is a
@@ -67,8 +69,14 @@ const DEFAULT_STOREFRONTS = [
   // Oceania
   "au", "nz",
 ];
-const DEFAULT_CONCURRENCY = 16; // matches services/analysis's Dockerfile --workers count
-const DEFAULT_AVG_LATENCY_S = 6; // midpoint of the "3-8s per 30s preview" figure in services/analysis/README.md
+// The analysis service now runs a SINGLE uvicorn worker (the CLAP checkpoint is
+// ~2GB resident) and bounds real parallelism internally via ANALYSIS_CONCURRENCY.
+// Sending more than that just queues at the service, so this default tracks the
+// service-side semaphore rather than a worker count. Raise both together.
+const DEFAULT_CONCURRENCY = 4;
+// CLAP inference on top of the librosa/essentia pass; slower than the previous
+// DSP-only pipeline. Re-measure against a real deploy before trusting estimates.
+const DEFAULT_AVG_LATENCY_S = 12;
 
 interface Args {
   dryRun: boolean;
@@ -256,36 +264,18 @@ async function analyzeAndStore(
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Service-Secret": serviceSecret },
     body: JSON.stringify({ preview_url: candidate.previewUrl, spotify_id: candidate.spotifyId }),
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(60_000),
   });
 
   if (!res.ok) {
     throw new Error(`analysis service returned ${res.status}: ${await res.text()}`);
   }
 
-  const analysis = await res.json();
-
-  const { error } = await supabase.from("track_features").upsert(
-    {
-      spotify_id: candidate.spotifyId,
-      source: "seed",
-      analysis_version: "2.0",
-      bpm: analysis.bpm,
-      key_name: analysis.key_name,
-      key_mode: analysis.key_mode,
-      key_confidence: analysis.key_confidence ?? null,
-      time_signature: analysis.time_signature ?? null,
-      harmonic_rhythm: analysis.harmonic_rhythm ?? null,
-      danceability: analysis.danceability,
-      dynamic_complexity: analysis.dynamic_complexity,
-      segments: analysis.segments,
-      embedding: analysis.embedding,
-      analyzed_at: new Date().toISOString(),
-    },
-    { onConflict: "spotify_id" }
-  );
-
-  if (error) throw new Error(`Supabase upsert failed: ${error.message}`);
+  await storeAnalysis(supabase, {
+    spotifyId: candidate.spotifyId,
+    source: "seed",
+    analysis: (await res.json()) as AnalysisResponse,
+  });
 }
 
 interface Stats {
@@ -391,11 +381,16 @@ async function main(): Promise<void> {
     } else {
       const resolved = outcome.candidate;
 
+      // "Already analyzed" means it has searchable windows in the CURRENT
+      // embedding space. Checking track_features instead would skip tracks
+      // carrying stale metadata from a previous embedding model, leaving them
+      // permanently unsearchable.
       const { data: existing } = await supabase
-        .from("track_features")
-        .select("spotify_id, source")
+        .from("moment_embeddings")
+        .select("spotify_id")
         .eq("spotify_id", resolved.spotifyId)
-        .neq("source", "synthetic")
+        .eq("embedding_model", EMBEDDING_MODEL_ID)
+        .limit(1)
         .maybeSingle();
 
       if (existing) {

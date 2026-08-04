@@ -6,26 +6,7 @@ import { createClient } from "@supabase/supabase-js";
 import { getTrack } from "@/lib/spotify";
 import { getSongByISRC } from "@/lib/apple-music";
 import { z } from "zod";
-import type { MomentDescriptor } from "@splice/types";
-
-/**
- * Converts a MomentDescriptor's 6 normalized scores into a 128-dim unit vector
- * usable for pgvector cosine similarity matching.
- * Tracks described with similar moment qualities will get similar embeddings.
- */
-function descriptorToEmbedding(d: MomentDescriptor): number[] {
-  const v = [
-    d.energy_profile,
-    d.timbral_character,
-    d.harmonic_tension,
-    d.structural_position,
-    d.textural_density,
-    d.emotional_arc,
-  ];
-  const e = Array.from({ length: 128 }, (_, i) => v[i % 6]);
-  const mag = Math.sqrt(e.reduce((s, x) => s + x * x, 0));
-  return mag > 0 ? e.map((x) => x / mag) : e;
-}
+import { segmentAtTimestamp, type TrackSegment } from "@/lib/segments";
 
 // Service role client bypasses RLS for transient moment creation
 function getServiceClient() {
@@ -153,12 +134,11 @@ export async function POST(request: NextRequest) {
       .single();
 
     if (existingAnalysis?.analysis_version === "2.0" && existingAnalysis.key_name) {
-      type SegRow = { start_s: number; chord_label?: string; chord_confidence?: number };
-      const segs = (existingAnalysis.segments ?? []) as SegRow[];
+      const segs = (existingAnalysis.segments ?? []) as TrackSegment[];
       let segChord: string | undefined;
       let segChordConf: number | undefined;
       if (timestamp_s !== undefined) {
-        const matchSeg = segs.filter((s) => s.start_s <= timestamp_s).pop();
+        const matchSeg = segmentAtTimestamp(segs, timestamp_s);
         segChord = matchSeg?.chord_label;
         segChordConf = matchSeg?.chord_confidence;
       }
@@ -227,32 +207,15 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  // Store a synthetic embedding derived from the Claude descriptor so this track
-  // is immediately searchable by the vector catalog — even before the Python
-  // analysis service has run. Only inserted when no real analysis exists yet;
-  // on_demand/acousticbrainz entries are left untouched.
-  const { data: existingFeatures } = await serviceSupabase
-    .from("track_features")
-    .select("spotify_id, source")
-    .eq("spotify_id", trackId)
-    .single();
-
-  if (!existingFeatures) {
-    const syntheticEmbedding = descriptorToEmbedding(descriptor);
-    await serviceSupabase.from("track_features").insert({
-      spotify_id: trackId,
-      source: "synthetic",
-      analysis_version: "1.0",
-      segments: null,
-      bpm: null,
-      key_name: null,
-      key_mode: null,
-      danceability: null,
-      dynamic_complexity: null,
-      embedding: syntheticEmbedding,
-      analyzed_at: new Date().toISOString(),
-    });
-  }
+  // NOTE: this route used to insert a "synthetic" track_features row here —
+  // the descriptor's 6 scores tiled 21x to fill a 128-dim vector — so the track
+  // would be "immediately searchable" before the analysis service had run.
+  //
+  // That was actively harmful. The tiled vector shares no space with the real
+  // librosa/essentia embeddings, but /api/match read it as the query vector
+  // anyway, so every search ran on a meaningless query and the results were
+  // noise. Real analysis is now the only path to a searchable embedding; until
+  // it completes, /api/match honestly reports analysis_pending.
 
   return NextResponse.json({ descriptor, momentId: moment.id });
 }

@@ -10,6 +10,7 @@ import { inngest } from "./client";
 import { createClient } from "@supabase/supabase-js";
 import { getChartTracks } from "@/lib/apple-music";
 import { searchTracks } from "@/lib/spotify";
+import { storeAnalysis, type AnalysisResponse } from "@/lib/store-analysis";
 
 const supabaseAdmin = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -68,29 +69,11 @@ export const analyzeTrack = inngest.createFunction(
     });
 
     await step.run("store-features", async () => {
-      const { error } = await supabaseAdmin
-        .from("track_features")
-        .upsert(
-          {
-            spotify_id: spotifyId,
-            source: "on_demand",
-            analysis_version: "2.0",
-            bpm: analysis.bpm,
-            key_name: analysis.key_name,
-            key_mode: analysis.key_mode,
-            key_confidence: analysis.key_confidence ?? null,
-            time_signature: analysis.time_signature ?? null,
-            harmonic_rhythm: analysis.harmonic_rhythm ?? null,
-            danceability: analysis.danceability,
-            dynamic_complexity: analysis.dynamic_complexity,
-            segments: analysis.segments,
-            embedding: analysis.embedding,
-            analyzed_at: new Date().toISOString(),
-          },
-          { onConflict: "spotify_id" }
-        );
-
-      if (error) throw new Error(`Supabase insert failed: ${error.message}`);
+      await storeAnalysis(supabaseAdmin, {
+        spotifyId,
+        source: "on_demand",
+        analysis: analysis as AnalysisResponse,
+      });
     });
 
     await step.run("mark-complete", async () => {

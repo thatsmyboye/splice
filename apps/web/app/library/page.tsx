@@ -2,7 +2,8 @@ import { redirect } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
 import { createClient } from "@/lib/supabase/server";
-import { ArrowLeft, Music } from "lucide-react";
+import { SiteHeader } from "@/components/layout/SiteHeader";
+import { Music } from "lucide-react";
 
 export const metadata = {
   title: "My Moments | splice",
@@ -32,15 +33,7 @@ export default async function LibraryPage() {
 
   return (
     <div className="min-h-screen">
-      <header className="sticky top-0 z-10 border-b border-border bg-background/80 backdrop-blur-sm px-4 py-3 flex items-center gap-4">
-        <Link
-          href="/"
-          className="text-muted-foreground hover:text-foreground transition-colors"
-        >
-          <ArrowLeft className="h-5 w-5" />
-        </Link>
-        <span className="font-semibold text-lg tracking-tight">My Moments</span>
-      </header>
+      <SiteHeader backHref="/" title="My Moments" />
 
       <div className="max-w-3xl mx-auto px-4 py-8">
         {!moments || moments.length === 0 ? (

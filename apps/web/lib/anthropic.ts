@@ -197,7 +197,11 @@ export async function interpretMoment(params: {
 // Match explanation (re-ranking)
 // ============================================================
 
-const EXPLAIN_SYSTEM_PROMPT = `You are a music analyst. You will be given a source musical moment description and a list of matched songs. For each matched song, write a single short sentence (max 15 words) explaining why it shares a similar musical moment to the source. Focus on the specific sonic or structural quality that connects them — not genre.
+const EXPLAIN_SYSTEM_PROMPT = `You are a music analyst. You will be given a source musical moment and a list of matched moments from other songs, each with measured audio features (timestamp, BPM, key, chord sounding at that moment).
+
+For each match, write a single short sentence (max 15 words) explaining what connects it to the source moment. Focus on the specific sonic or structural quality — not genre.
+
+Ground every explanation in the measured features you are given. If two moments share a key, a tempo range, or a chord quality, say so. Do NOT invent details you cannot see: you have not heard either recording, and you know nothing about arrangement, instrumentation, lyrics, or production beyond the numbers provided. When the features give you little to work with, describe the similarity in general terms rather than fabricating specifics.
 
 Respond with ONLY valid JSON, no preamble:
 {
@@ -207,16 +211,47 @@ Respond with ONLY valid JSON, no preamble:
   ]
 }`;
 
+/** Compact "120 BPM, Am, chord F" style summary; omits whatever is unknown. */
+function formatFeatures(f: {
+  bpm?: number | null;
+  key_name?: string | null;
+  key_mode?: string | null;
+  chord_label?: string | null;
+  timestamp_s?: number | null;
+}): string {
+  const parts: string[] = [];
+  if (f.timestamp_s !== null && f.timestamp_s !== undefined) {
+    const m = Math.floor(f.timestamp_s / 60);
+    const s = Math.floor(f.timestamp_s % 60);
+    parts.push(`at ${m}:${s.toString().padStart(2, "0")}`);
+  }
+  if (f.bpm) parts.push(`${Math.round(f.bpm)} BPM`);
+  if (f.key_name) parts.push(`key ${f.key_name}${f.key_mode === "minor" ? "m" : ""}`);
+  if (f.chord_label && f.chord_label !== "N") parts.push(`chord ${f.chord_label}`);
+  return parts.length ? parts.join(", ") : "no measured features";
+}
+
 export async function explainMatches(params: {
   sourceMomentDescriptor: MomentDescriptor;
-  sourceTrack: { title: string; artist: string };
+  sourceTrack: {
+    title: string;
+    artist: string;
+    bpm?: number | null;
+    key_name?: string | null;
+    key_mode?: string | null;
+    chord_label?: string | null;
+    timestamp_s?: number | null;
+  };
   matches: Array<{
     spotify_id: string;
     title: string;
     artist: string;
     similarity_score: number;
+    timestamp_s?: number | null;
+    bpm?: number | null;
     key_name?: string | null;
     key_mode?: string | null;
+    chord_label?: string | null;
   }>;
 }): Promise<Map<string, string>> {
   const { sourceMomentDescriptor: descriptor, sourceTrack, matches } = params;
@@ -224,21 +259,20 @@ export async function explainMatches(params: {
   if (matches.length === 0) return new Map();
 
   const sourceDesc = [
-    `"${sourceTrack.title}" by ${sourceTrack.artist}`,
+    `"${sourceTrack.title}" by ${sourceTrack.artist} (${formatFeatures(sourceTrack)})`,
     `Moment: ${descriptor.energy_profile_label}, ${descriptor.timbral_character_label},`,
     `${descriptor.harmonic_tension_label}, ${descriptor.textural_density_label}`,
     `(${descriptor.reasoning})`,
   ].join(" ");
 
   const matchList = matches
-    .map((m) => {
-      const keyInfo =
-        m.key_name ? `, key: ${m.key_name} ${m.key_mode ?? ""}`.trim() : "";
-      return `- spotify_id: ${m.spotify_id}, title: "${m.title}", artist: ${m.artist}${keyInfo}`;
-    })
+    .map(
+      (m) =>
+        `- spotify_id: ${m.spotify_id}, title: "${m.title}", artist: ${m.artist}, ${formatFeatures(m)}`
+    )
     .join("\n");
 
-  const userPrompt = `Source moment:\n${sourceDesc}\n\nMatched songs:\n${matchList}\n\nExplain why each matched song shares a similar moment.`;
+  const userPrompt = `Source moment:\n${sourceDesc}\n\nMatched moments:\n${matchList}\n\nExplain what connects each matched moment to the source.`;
 
   const response = await client.messages.create({
     model: MODEL,

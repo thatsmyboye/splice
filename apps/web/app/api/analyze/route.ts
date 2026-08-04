@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 import { inngest } from "@/inngest/client";
 import { getSongByISRC } from "@/lib/apple-music";
+import { EMBEDDING_MODEL_ID } from "@/lib/analysis-service";
 import { z } from "zod";
 
 function getServiceClient() {
@@ -9,6 +10,29 @@ function getServiceClient() {
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!
   );
+}
+
+/**
+ * A track counts as analyzed only when it has searchable windows in the
+ * CURRENT embedding space.
+ *
+ * Checking track_features instead would report "complete" for tracks carrying
+ * metadata from an earlier embedding model — the search would then find
+ * nothing for them, forever, with no job ever re-queued.
+ */
+async function hasSearchableWindows(
+  supabase: ReturnType<typeof getServiceClient>,
+  spotifyId: string
+): Promise<boolean> {
+  const { data } = await supabase
+    .from("moment_embeddings")
+    .select("spotify_id")
+    .eq("spotify_id", spotifyId)
+    .eq("embedding_model", EMBEDDING_MODEL_ID)
+    .limit(1)
+    .maybeSingle();
+
+  return !!data;
 }
 
 export async function GET(request: NextRequest) {
@@ -19,15 +43,7 @@ export async function GET(request: NextRequest) {
 
   const serviceSupabase = getServiceClient();
 
-  // Synthetic embeddings are placeholders — only real analysis counts as complete.
-  const { data: existing } = await serviceSupabase
-    .from("track_features")
-    .select("spotify_id, source")
-    .eq("spotify_id", spotifyId)
-    .neq("source", "synthetic")
-    .single();
-
-  if (existing) {
+  if (await hasSearchableWindows(serviceSupabase, spotifyId)) {
     return NextResponse.json({ status: "complete", jobId: null });
   }
 
@@ -70,15 +86,7 @@ export async function POST(request: NextRequest) {
 
   const serviceSupabase = getServiceClient();
 
-  // Synthetic embeddings are placeholders — only real analysis counts as complete.
-  const { data: existing } = await serviceSupabase
-    .from("track_features")
-    .select("spotify_id, source")
-    .eq("spotify_id", spotifyId)
-    .neq("source", "synthetic")
-    .single();
-
-  if (existing) {
+  if (await hasSearchableWindows(serviceSupabase, spotifyId)) {
     return NextResponse.json({ status: "complete", jobId: null });
   }
 

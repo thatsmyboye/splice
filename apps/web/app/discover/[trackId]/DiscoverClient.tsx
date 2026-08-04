@@ -1,18 +1,19 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import Image from "next/image";
-import Link from "next/link";
 import type { SpotifyTrack, MomentMatch, MomentDescriptor, SourceAnalysis } from "@splice/types";
+import { SiteHeader } from "@/components/layout/SiteHeader";
 import { WaveformScrubber } from "@/components/waveform/WaveformScrubber";
 import { MomentCard } from "@/components/moment-card/MomentCard";
 import { MomentAnalysisPanel } from "@/components/moment-card/MomentAnalysisPanel";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ArrowLeft, Loader2, Music, Scissors } from "lucide-react";
-import { TrackTimeline } from "@/components/waveform/TrackTimeline";
-import type { MomentSelection } from "@/components/waveform/TrackTimeline";
+import { Bookmark, BookmarkCheck, Loader2, Music, Scissors } from "lucide-react";
+import type { MomentSelection } from "@/components/waveform/types";
+import { AudioDropzone } from "@/components/waveform/AudioDropzone";
+import { isDeepCutEligible } from "@/lib/matching";
 
 type Stage = "select" | "loading" | "analyzing" | "results" | "error";
 
@@ -32,31 +33,152 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
   const [sourceAnalysis, setSourceAnalysis] = useState<SourceAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [deepCutMode, setDeepCutMode] = useState(false);
+  // Distinguishes the three ways a result set can be empty, so the UI can say
+  // which one happened instead of rendering "no matches" for all of them.
+  const [noAudio, setNoAudio] = useState(false);
+  const [analysisTimedOut, setAnalysisTimedOut] = useState(false);
+
+  // Full-track upload. `objectUrl` drives the waveform locally (no round-trip);
+  // `fullTrackReady` flips once the server has embedded the whole recording.
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [fullTrackReady, setFullTrackReady] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
+  // Saving. `momentId` is the row /api/interpret created for this search; it's
+  // what the save endpoint claims into the user's library.
+  const [momentId, setMomentId] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Object URLs hold the file in memory until explicitly released.
+  useEffect(() => {
+    return () => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [objectUrl]);
 
   // Server-side filtering is the primary mechanism for Deep Cut mode — it over-fetches
   // candidates from pgvector and filters before returning, so results here are already
   // obscure when deepCutMode was on at search time. The client-side filter below acts
   // as a lightweight display guard for any stragglers (e.g. toggling mode post-search).
-  const DEEP_CUT_MAX_POPULARITY = 40;
   const sourceArtistNames = track.artists.map((a) => a.name.toLowerCase());
   const visibleMatches = deepCutMode
-    ? matches.filter((m) => {
-        const popularityOk = m.popularity === null || m.popularity <= DEEP_CUT_MAX_POPULARITY;
-        const matchArtistLower = m.artist.toLowerCase();
-        const sameArtist = sourceArtistNames.some(
-          (name) => matchArtistLower.includes(name) || name.includes(matchArtistLower)
-        );
-        return popularityOk && !sameArtist;
-      })
+    ? matches.filter((m) =>
+        isDeepCutEligible({
+          popularity: m.popularity ?? null,
+          matchArtist: m.artist,
+          sourceArtistNames,
+        })
+      )
     : matches;
 
   const artwork = track.album.images[0]?.url;
   const artist = track.artists.map((a) => a.name).join(", ");
-  const canSubmit = selection !== null || description.trim().length > 0;
+
+  // An uploaded file wins over the preview: it's the whole recording, so a
+  // mark anywhere in the song refers to audio that was actually analyzed.
+  const audioUrl = objectUrl ?? track.preview_url ?? null;
+  const audioSource: "upload" | "preview" | "none" = objectUrl
+    ? "upload"
+    : track.preview_url
+      ? "preview"
+      : "none";
+
+  // Without audio, a timestamp can't be matched against anything — but a typed
+  // description still can, because CLAP embeds text into the same space as the
+  // catalog's audio windows.
+  const canSubmit =
+    !uploading && (selection !== null || description.trim().length > 0);
 
   const handleMomentSelect = useCallback((sel: MomentSelection) => {
     setSelection(sel);
+  }, []);
+
+  const handleFileSelected = useCallback(
+    async (file: File) => {
+      setObjectUrl((previous) => {
+        if (previous) URL.revokeObjectURL(previous);
+        return URL.createObjectURL(file);
+      });
+      setUploadFile(file);
+      setUploadError(null);
+      setFullTrackReady(false);
+      setSelection(null); // marks referred to the previous audio's timeline
+      setUploading(true);
+
+      // Analyze immediately rather than at search time, so the work overlaps
+      // with the user choosing their moment instead of stacking after it.
+      try {
+        const form = new FormData();
+        form.append("file", file);
+        form.append("spotifyId", track.id);
+
+        const res = await fetch("/api/analyze/upload", {
+          method: "POST",
+          body: form,
+        });
+
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          throw new Error(body.error ?? "Could not analyze that file");
+        }
+
+        setFullTrackReady(true);
+      } catch (err) {
+        setUploadError(
+          err instanceof Error ? err.message : "Could not analyze that file"
+        );
+      } finally {
+        setUploading(false);
+      }
+    },
+    [track.id]
+  );
+
+  const handleToggleSave = useCallback(async () => {
+    if (!momentId) return;
+    setSaving(true);
+    setSaveError(null);
+    const next = !saved;
+
+    try {
+      const res = await fetch("/api/moments/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ momentId, saved: next }),
+      });
+
+      if (res.status === 401) {
+        setSaveError("Sign in (top right) to save moments.");
+        return;
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error ?? "Could not save");
+      }
+
+      setSaved(next);
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : "Could not save");
+    } finally {
+      setSaving(false);
+    }
+  }, [momentId, saved]);
+
+  const handleClearFile = useCallback(() => {
+    setObjectUrl((previous) => {
+      if (previous) URL.revokeObjectURL(previous);
+      return null;
+    });
+    setUploadFile(null);
+    setUploadError(null);
+    setFullTrackReady(false);
+    setSelection(null);
   }, []);
 
   const stopPolling = () => {
@@ -90,6 +212,9 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
   const pollUntilReady = (momentId: string, attemptsLeft: number) => {
     if (attemptsLeft <= 0) {
+      // Ran out of attempts while analysis was still in flight. This is not
+      // "nothing matched" — the search never got to run.
+      setAnalysisTimedOut(true);
       setMatches([]);
       setStage("results");
       return;
@@ -106,6 +231,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
           const { done } = await fetchMatches(momentId);
           if (!done) pollUntilReady(momentId, attemptsLeft - 1);
         } else if (status === "failed") {
+          setAnalysisTimedOut(true);
           setMatches([]);
           setStage("results");
         } else {
@@ -125,6 +251,11 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
     setError(null);
     setMatches([]);
     setSourceAnalysis(null);
+    setNoAudio(false);
+    setAnalysisTimedOut(false);
+    setMomentId(null);
+    setSaved(false);
+    setSaveError(null);
 
     try {
       const interpretRes = await fetch("/api/interpret", {
@@ -146,13 +277,32 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
       const { descriptor: desc, momentId } = await interpretRes.json();
       setDescriptor(desc);
+      setMomentId(momentId);
 
-      if (track.preview_url) {
-        fetch("/api/analyze", {
+      // A completed upload has already embedded the whole recording, so the
+      // preview path would only overwrite full-track windows with 30s ones.
+      if (!fullTrackReady) {
+        // Always request analysis. This used to be gated on `track.preview_url`,
+        // but Spotify no longer returns preview URLs for this app — the gate was
+        // never true, so no track was ever analyzed and every search ran against
+        // a placeholder vector. The server resolves the audio itself (Spotify
+        // preview, then Apple Music via ISRC), so the client shouldn't decide
+        // whether audio is obtainable.
+        const analyzeRes = await fetch("/api/analyze", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ spotifyId: track.id, previewUrl: track.preview_url }),
-        }).catch(() => {});
+        }).catch(() => null);
+
+        // 422 = no playable audio for this track anywhere. A description-only
+        // search still works (text embeds into the catalog's space), so only
+        // treat this as a dead end when there's nothing typed either.
+        if (analyzeRes?.status === 422 && !description.trim()) {
+          setNoAudio(true);
+          setMatches([]);
+          setStage("results");
+          return;
+        }
       }
 
       const { done, pending } = await fetchMatches(momentId);
@@ -181,12 +331,7 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
 
   return (
     <div className="min-h-screen">
-      <header className="sticky top-0 z-10 border-b border-border bg-background/80 backdrop-blur-sm px-4 py-3 flex items-center gap-4">
-        <Link href="/" className="text-muted-foreground hover:text-foreground transition-colors">
-          <ArrowLeft className="h-5 w-5" />
-        </Link>
-        <span className="font-semibold text-lg tracking-tight">splice</span>
-      </header>
+      <SiteHeader backHref="/" />
 
       <div className="max-w-3xl mx-auto px-4 py-8 space-y-8">
         {/* Track header */}
@@ -211,42 +356,69 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
           </div>
         </div>
 
-        {/* Waveform scrubber / track timeline */}
-        {track.preview_url ? (
-          <div className="space-y-2">
-            {selection !== null && (
-              <p className="text-sm text-primary font-medium">
-                Moment marked at {formatSelection(selection)}
-              </p>
-            )}
-            {selection === null && (
-              <p className="text-sm text-muted-foreground">
-                Scrub to a moment and click &ldquo;Mark this moment&rdquo;
-              </p>
-            )}
-            <WaveformScrubber
-              previewUrl={track.preview_url}
-              onMomentSelect={handleMomentSelect}
-            />
+        {/* Moment selection */}
+        <div className="space-y-2">
+          {selection !== null ? (
+            <p className="text-sm text-primary font-medium">
+              Moment marked at {formatSelection(selection)}
+            </p>
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {audioSource === "none"
+                ? "No audio available for this track — add your own file to mark a moment, or describe it below."
+                : "Scrub to a moment and click “Mark moment”"}
+            </p>
+          )}
+
+          {audioUrl ? (
+            <WaveformScrubber audioUrl={audioUrl} onMomentSelect={handleMomentSelect} />
+          ) : (
+            // Deliberately no timeline here. Previously this rendered a
+            // full-duration scrubber even with no audio, which let the user
+            // mark 3:40 of a track where nothing had been analyzed — the
+            // timestamp looked meaningful but fed nothing into the search.
+            <div className="rounded-xl border border-dashed border-border bg-secondary/40 px-4 py-6 text-center text-sm text-muted-foreground">
+              Nothing to scrub yet.
+            </div>
+          )}
+
+          {/* What is actually being analyzed. The preview and full-track cases
+              use the same scrubber over very different spans of audio, and
+              previously nothing on screen said which one you were in. */}
+          <div className="flex items-center justify-between gap-3 text-xs">
+            <span className="text-muted-foreground">
+              {audioSource === "upload" ? (
+                fullTrackReady ? (
+                  <>
+                    Matching against the <strong className="text-foreground">full track</strong>{" "}
+                    you provided.
+                  </>
+                ) : (
+                  <>Reading your file&hellip;</>
+                )
+              ) : audioSource === "preview" ? (
+                <>
+                  Matching against the{" "}
+                  <strong className="text-foreground">30-second preview</strong> only.
+                </>
+              ) : (
+                <>No audio loaded.</>
+              )}
+            </span>
           </div>
-        ) : (
-          <div className="space-y-2">
-            {selection !== null && (
-              <p className="text-sm text-primary font-medium">
-                Moment marked at {formatSelection(selection)}
-              </p>
-            )}
-            {selection === null && (
-              <p className="text-sm text-muted-foreground">
-                No audio preview — scrub the timeline to mark where the moment is in the track
-              </p>
-            )}
-            <TrackTimeline
-              durationMs={track.duration_ms}
-              onMomentSelect={handleMomentSelect}
-            />
-          </div>
-        )}
+
+          <AudioDropzone
+            fileName={uploadFile?.name ?? null}
+            busy={uploading}
+            onFileSelected={handleFileSelected}
+            onClear={handleClearFile}
+            disabled={stage === "loading" || stage === "analyzing"}
+          />
+
+          {uploadError && (
+            <p className="text-xs text-destructive">{uploadError}</p>
+          )}
+        </div>
 
         {/* Description input + submit */}
         <div className="space-y-3">
@@ -327,24 +499,78 @@ export function DiscoverClient({ track }: DiscoverClientProps) {
         {/* Results */}
         {stage === "results" && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-3">
               <h2 className="text-lg font-semibold">
                 {visibleMatches.length > 0
                   ? `${visibleMatches.length} similar moment${visibleMatches.length === 1 ? "" : "s"}${deepCutMode && visibleMatches.length < matches.length ? ` (${matches.length - visibleMatches.length} hidden by Deep Cut)` : ""}`
                   : "No matches found yet"}
               </h2>
+
+              {momentId && (
+                <Button
+                  variant={saved ? "secondary" : "outline"}
+                  size="sm"
+                  onClick={handleToggleSave}
+                  disabled={saving}
+                  className="shrink-0 gap-1.5"
+                >
+                  {saving ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : saved ? (
+                    <BookmarkCheck className="h-3.5 w-3.5" />
+                  ) : (
+                    <Bookmark className="h-3.5 w-3.5" />
+                  )}
+                  {saved ? "Saved" : "Save moment"}
+                </Button>
+              )}
             </div>
+
+            {saveError && <p className="text-xs text-destructive">{saveError}</p>}
 
             {descriptor && (
               <MomentAnalysisPanel descriptor={descriptor} sourceAnalysis={sourceAnalysis} />
             )}
 
             {visibleMatches.length === 0 ? (
-              <p className="text-sm text-muted-foreground py-8 text-center">
-                {deepCutMode && matches.length > 0
-                  ? "All matches were filtered by Deep Cut mode. Try turning it off to see results."
-                  : "No matches found for this moment yet. Try adding a description to sharpen the search."}
-              </p>
+              <div className="text-sm text-muted-foreground py-8 text-center space-y-1">
+                {noAudio ? (
+                  <>
+                    <p className="text-foreground font-medium">
+                      No playable audio for this track.
+                    </p>
+                    <p>
+                      Neither Spotify nor Apple Music returned a preview, so there was
+                      nothing to analyze. Matching needs audio — try another track.
+                    </p>
+                  </>
+                ) : analysisTimedOut ? (
+                  <>
+                    <p className="text-foreground font-medium">
+                      Audio analysis didn&rsquo;t finish in time.
+                    </p>
+                    <p>
+                      The search never ran — this isn&rsquo;t a &ldquo;nothing similar&rdquo;
+                      result. Try again in a moment.
+                    </p>
+                  </>
+                ) : deepCutMode && matches.length > 0 ? (
+                  <p>
+                    All matches were filtered by Deep Cut mode. Try turning it off to see
+                    results.
+                  </p>
+                ) : (
+                  <>
+                    <p className="text-foreground font-medium">
+                      Nothing in the catalog is close enough to call a match.
+                    </p>
+                    <p>
+                      Try adding a description to sharpen the search, or pick a different
+                      moment.
+                    </p>
+                  </>
+                )}
+              </div>
             ) : (
               <div className="space-y-3">
                 {visibleMatches.map((match) => (

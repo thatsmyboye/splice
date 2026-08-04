@@ -1,6 +1,7 @@
 # Splice Analysis Service
 
-FastAPI microservice for audio feature extraction. Deployed on Railway via Docker.
+FastAPI microservice that turns audio into **moment embeddings** — the vectors
+pgvector searches — plus display metadata. Deployed on Railway via Docker.
 
 ## Local Development
 
@@ -11,23 +12,44 @@ cd services/analysis
 python -m venv .venv
 source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 
-# Install deps (takes a few minutes — essentia is large)
+# Install deps (slow — essentia is large, and torch/CLAP add ~2GB)
+pip install --index-url https://download.pytorch.org/whl/cpu torch==2.2.2 torchaudio==2.2.2
 pip install -r requirements.txt
+
+# Fetch the CLAP checkpoint (~2.35GB) and point CLAP_CHECKPOINT_PATH at it
+curl -fsSL -o ./music_audioset_epoch_15_esc_90.14.pt \
+  https://huggingface.co/lukewys/laion_clap/resolve/main/music_audioset_epoch_15_esc_90.14.pt
 
 # Set env vars
 cp .env.example .env
-# Edit .env: set ANALYSIS_SERVICE_SECRET to any string for local dev
+# Edit .env: ANALYSIS_SERVICE_SECRET can be any string for local dev.
+# Set CLAP_CHECKPOINT_PATH to wherever you saved the .pt file above.
 
-# Run
+# Run. Startup loads the checkpoint before serving, so the first boot is slow
+# and a missing/corrupt checkpoint fails loudly here rather than mid-request.
 uvicorn main:app --reload --port 8000
 ```
 
-Test it:
+Check it came up in the right embedding space:
+```bash
+curl http://localhost:8000/health
+# {"status":"ok","embedding_model":"clap-music-audioset-v1","model_loaded":true,...}
+```
+
+Analyze a preview:
 ```bash
 curl -X POST http://localhost:8000/analyze \
   -H "Content-Type: application/json" \
   -H "X-Service-Secret: your_secret_here" \
-  -d '{"preview_url": "https://p.scdn.co/mp3-preview/...", "spotify_id": "test123"}'
+  -d '{"audio_url": "https://example.com/preview.mp3", "spotify_id": "test123"}'
+```
+
+Analyze a local full-length file:
+```bash
+curl -X POST http://localhost:8000/analyze-upload \
+  -H "X-Service-Secret: your_secret_here" \
+  -F "file=@/path/to/track.mp3" \
+  -F "spotify_id=test123"
 ```
 
 ## Railway Deployment
@@ -39,144 +61,73 @@ curl -X POST http://localhost:8000/analyze \
 5. Set environment variables in Railway dashboard:
    - `ANALYSIS_SERVICE_SECRET` — must match the value in `apps/web/.env.local`
    - `PORT=8000`
+   - `ANALYSIS_CONCURRENCY` — see "Memory and concurrency" below
 6. Copy the generated domain → set as `ANALYSIS_SERVICE_URL` in web app
+7. Verify before seeding anything: `curl $ANALYSIS_SERVICE_URL/health` should
+   report `model_loaded: true` and the expected `embedding_model`
 
-## AcousticBrainz Bulk Import (legacy — superseded)
+## Embedding Model
 
-**This approach is no longer recommended.** AcousticBrainz's low-level data is
-track-level aggregates only (no real segment boundaries — `build_segments()`
-below fabricates one synthetic full-track segment), and the 128-dim embedding
-layout this script builds is structurally different from the one
-`services/analysis/main.py`'s `build_embedding()` produces for on-demand
-analysis. The two are not comparable by cosine similarity, which silently
-broke match quality for any AcousticBrainz-sourced result.
+Moment search runs on **LAION-CLAP** (`music_audioset_epoch_15_esc_90.14.pt`),
+which produces 512-dim vectors in a space shared by audio *and* text.
 
-The current approach is `apps/web/scripts/seed-catalog.ts`, which builds
-initial catalog coverage by running a diverse seed track list through the
-*same* on-demand pipeline used for live user searches — one embedding space,
-genuine per-segment features, from the first row on. This section is kept
-for reference only.
+Two consequences worth internalising:
 
-One-time setup that pre-populates `track_features` with ~500K tracks so the app
-has a searchable corpus before any user triggers on-demand analysis.
+- A typed description ("the bit where everything drops out") can be embedded
+  with `/embed-text` and matched against catalog audio directly. No LLM sits in
+  the retrieval path.
+- `EMBEDDING_MODEL_ID` in `main.py` labels every vector this service emits.
+  **Change the checkpoint, change that ID, and re-seed.** Vectors from two
+  checkpoints are not comparable by cosine similarity, and mixing them does not
+  raise an error — it just returns confident nonsense. That failure is exactly
+  what made the old AcousticBrainz catalog useless.
 
-### Prerequisites
+The librosa/essentia pass still runs, but only for **display metadata** (key,
+BPM, time signature, per-section chords). It never contributes to search.
 
-```bash
-pip install supabase numpy tqdm
-# zstd is required to extract the archives:
-# macOS:  brew install zstd
-# Ubuntu: sudo apt install zstd
-```
+## Windows, not tracks
 
-### Step 1 — Download the archive(s)
+`/analyze` returns a sliding window over the audio — 10s wide, 5s hop — each
+with its own embedding and `[start_s, end_s)`. The web app stores these in
+`moment_embeddings`, so a search hit carries a real timestamp instead of the
+API having to invent one.
 
-The low-level JSON dump lives at:
-```
-https://data.metabrainz.org/pub/musicbrainz/acousticbrainz/dumps/acousticbrainz-lowlevel-json-20220623/
-```
+CLAP's audio encoder natively consumes ~10s chunks, which is where the window
+size comes from; the 50% overlap keeps a moment that straddles a boundary near
+the centre of at least one window.
 
-There are 29 files (`json-0` through `json-28`), each ~120 GB uncompressed.
-**You only need 1–2 files** for a 500K-track corpus.
+## Memory and concurrency
 
-- For a quick start, download `json-0` (~120 GB uncompressed, ~30–40 GB compressed).
-- For broader MBID coverage, also grab `json-14` (the midpoint of the range).
+> ⚠️ **Run exactly one uvicorn worker.**
 
-```bash
-# Example — adjust filename/URL as needed
-wget https://data.metabrainz.org/pub/musicbrainz/acousticbrainz/dumps/acousticbrainz-lowlevel-json-20220623/acousticbrainz-lowlevel-json-20220623-json-0.tar.zst
-```
+The checkpoint is ~2GB resident and each worker is a separate process with its
+own copy. The Dockerfile previously ran `--workers 16`, which would have needed
+roughly 32GB of RAM. Real parallelism comes from `ANALYSIS_CONCURRENCY`, a
+semaphore over a threadpool inside the single process — the right shape anyway,
+since analysis is CPU-bound rather than IO-bound.
 
-### Step 2 — Extract
+The image is large (CPU-only torch plus the baked-in 2.35GB checkpoint,
+~5-6GB total). If that exceeds your Railway build limits, drop the `curl` step
+from the Dockerfile and mount the checkpoint from a volume instead, pointing
+`CLAP_CHECKPOINT_PATH` at it.
 
-```bash
-tar --use-compress-program=unzstd \
-    -xf acousticbrainz-lowlevel-json-20220623-json-0.tar.zst
-```
+## Legacy: AcousticBrainz import
 
-This creates a directory tree organized by MBID:
-```
-0/
-  00/
-    00xxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.json
-  01/
-    ...
-```
+`import_acousticbrainz.py` is **retired**. Its data is track-level aggregates
+only (the import fabricated a single full-track "segment"), and it embedded into
+a different space than this service produces. Both problems are fatal for moment
+matching. The catalog is now built by `apps/web/scripts/seed-catalog.ts`, which
+runs seed tracks through the same `/analyze` endpoint that serves live searches.
 
-Each `.json` file is one AcousticBrainz recording submission containing the
-full low-level feature output from Essentia.
-
-### Step 3 — Run the import
-
-```bash
-python import_acousticbrainz.py \
-  --input ./acousticbrainz-lowlevel-json-20220623-json-0 \
-  --supabase-url https://YOUR_PROJECT.supabase.co \
-  --supabase-key YOUR_SERVICE_ROLE_KEY \
-  --limit 500000
-```
-
-Options:
-
-| Flag | Default | Description |
-|---|---|---|
-| `--limit N` | 500000 | Stop after N records |
-| `--offset N` | 0 | Skip first N files (resume an interrupted run) |
-| `--batch-size N` | 500 | Rows per Supabase upsert call |
-
-Runtime: ~60–120 min for 500K rows. The script is safe to interrupt and
-resume — records are upserted on `mbid`, so duplicates are silently skipped.
-
-### Step 4 — Verify
-
-Run in the Supabase SQL editor:
-
-```sql
-SELECT
-  count(*)          AS total,
-  source,
-  min(created_at)   AS first_imported,
-  max(created_at)   AS last_imported
-FROM track_features
-GROUP BY source;
-```
-
-Expected: `~500000` rows with `source = 'acousticbrainz'`.
-
-### Notes on the import
-
-- **Which files to download**: each archive covers MBIDs whose leading hex
-  character falls in a particular range. `json-0` contains MBIDs starting with
-  `0x`; `json-14` covers roughly `ex`. Any single archive contains well over
-  500K recordings, so one file is sufficient for an initial corpus.
-
-- **Embedding quality**: the JSON import uses the full Essentia low-level
-  feature set (MFCC, GFCC, chroma, bark bands, spectral contrast, etc.) to
-  build genuine 128-dim embeddings. This is significantly richer than the old
-  CSV-based import, which only had ~30 real dimensions.
-
-- **Multiple submissions**: AcousticBrainz sometimes has several submissions for
-  the same MBID (e.g. `{mbid}-0.json`, `{mbid}-1.json`). The importer keeps
-  only submission `0` (the most-played version) and ignores the rest.
-
-- **Spotify linkage**: imported rows use `spotify_id = "ab:{mbid}"` as a
-  placeholder. When a user searches for a Spotify track, the app looks up the
-  corresponding MusicBrainz recording ID and joins on `mbid` to find the
-  pre-indexed features. If no match is found, on-demand analysis via the
-  Spotify 30s preview URL is triggered instead.
-
-- **analysis_version**: rows imported by this script are tagged `2.0`. If you
-  re-run the import after a schema change, bump this value so you can
-  distinguish old rows.
-
----
+Do not reintroduce it.
 
 ## Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| GET | /health | Health check |
-| POST | /analyze | Analyze a 30s audio preview URL |
-| POST | /embed | Convert a MomentDescriptor to a 128-dim vector |
+| GET | /health | Health check; reports `embedding_model` and whether the checkpoint is loaded |
+| POST | /analyze | Audio URL (`preview_url` or `audio_url`) -> windowed embeddings + display metadata |
+| POST | /analyze-upload | Same, from a multipart file. Used for full-length user-supplied tracks; bytes are never persisted |
+| POST | /embed-text | Description -> 512-dim vector in the shared audio/text space |
 
-All non-health endpoints require `X-Service-Secret` header.
+All non-health endpoints require the `X-Service-Secret` header.

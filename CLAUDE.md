@@ -72,11 +72,12 @@ splice/
 | Auth | Supabase Auth | Google OAuth + magic link |
 | Database | Supabase (PostgreSQL) | pgvector extension for similarity search |
 | Background Jobs | Inngest | Analysis job queue |
-| AI/LLM | Anthropic Claude API | `claude-sonnet-4-5` for moment interpretation |
-| Audio Analysis | Python (librosa + essentia) | FastAPI microservice on Railway |
+| AI/LLM | Anthropic Claude API | `claude-sonnet-4-5` for moment interpretation + match explanation |
+| Moment Embeddings | LAION-CLAP (music checkpoint) | 512-dim joint audio/text space; **this is what search compares** |
+| Audio Analysis | Python (librosa + essentia) | Display metadata only (key/BPM/chords) — never searched |
 | Waveform UI | WaveSurfer.js | Scrubber + region selection |
 | Music Metadata | Spotify Web API | Track search + metadata only (no audio analysis) |
-| Music Catalog | AcousticBrainz data dump | Pre-indexed feature vectors in pgvector |
+| Music Catalog | Self-analyzed via `seed-catalog.ts` | Every row built by our own pipeline, one embedding space |
 | Hosting | Vercel (web) + Railway (analysis service) |
 | Package Manager | pnpm |
 | Monorepo | Turborepo |
@@ -129,15 +130,36 @@ PORT=8000
 -- users (managed by Supabase Auth, extended here)
 -- moments: user-saved moment annotations
 -- tracks: cached track metadata from Spotify
--- track_features: pre-indexed segment-level audio feature vectors
+-- track_features: per-track DISPLAY metadata (key, BPM, sections, chords)
+-- moment_embeddings: per-window CLAP vectors — the searchable index
 -- moment_matches: cached match results (TTL-based invalidation)
 ```
 
-See `supabase/migrations/0001_initial_schema.sql` for full schema including pgvector setup.
+See `supabase/migrations/0001_initial_schema.sql` for the base schema and
+`20260804010000_moment_embeddings.sql` for the moment-level search index.
 
-### Audio Feature Vector Schema
+### Moment Embedding Schema
 
-Each track in `track_features` stores a JSONB array of segment descriptors plus a `embedding vector(128)` column for pgvector similarity search. The 128-dimensional embedding is derived from the AcousticBrainz low-level features (MFCC means, chroma, spectral centroid, etc.) normalized and PCA-reduced.
+**Search operates on windows, not tracks.** `moment_embeddings` holds one row per
+~10s of audio (10s window, 5s hop), each with a 512-dim L2-normalized CLAP vector:
+
+```sql
+moment_embeddings(spotify_id, start_s, end_s, embedding vector(512), embedding_model)
+```
+
+Because each row carries its own timespan, **a search hit is a timestamp** — the
+moment shown on a result card is the moment that actually matched.
+
+Two rules that are not optional:
+
+1. **Never mix embedding spaces.** Vectors from different models are not
+   comparable by cosine similarity, and mixing them silently produces
+   confident-looking nonsense rather than an error. Every query filters on
+   `embedding_model`; `storeAnalysis()` refuses to write a mismatched vector.
+2. **`track_features.embedding` is vestigial.** It held the old hand-built
+   128-dim vector. Nothing reads it. Do not reintroduce track-level matching —
+   it makes moment search impossible by construction and forces the API to
+   invent timestamps.
 
 ---
 
@@ -159,20 +181,36 @@ Each track in `track_features` stores a JSONB array of segment descriptors plus 
 
 ### Flow 3: Audio Analysis (on-demand)
 
-If a track is not yet in `track_features`:
+If a track has no rows in `moment_embeddings` for the current model:
 1. Inngest job fires: `analysis/track.requested`
-2. Analysis service receives the Spotify preview URL (30s MP3)
-3. librosa extracts: segments, beats, sections, spectral features, chroma, MFCCs
-4. essentia extracts: tonal key, danceability, dynamic complexity
-5. Features are normalized, embedded into 128-dim vector, stored in Supabase
-6. Frontend polls until analysis complete, then proceeds to matching
+2. Analysis service resolves audio (Spotify preview → Apple Music preview via ISRC)
+3. CLAP embeds each 10s window → the searchable vectors
+4. librosa + essentia extract key/BPM/time signature/chords → display metadata only
+5. `storeAnalysis()` writes both, refusing any embedding-space mismatch
+6. Frontend polls until analysis completes, then proceeds to matching
+
+**Full-track path:** the user can supply their own audio file
+(`POST /api/analyze/upload`). Previews are only 30s, so a moment marked at 3:40
+could never correspond to analyzed audio — an upload removes that mismatch.
+Uploaded bytes are analyzed in memory and never persisted.
 
 ### Flow 4: Matching
 
-1. `POST /api/match` receives the `MomentDescriptor` + source track's feature vector for the selected segment
-2. pgvector `<=>` cosine similarity search over `track_features`
-3. Results ranked by: vector similarity × Claude-scored moment relevance (a lightweight re-ranking step)
-4. Each result card shows: track info, the timestamp of the matching moment, a one-line explanation of *why* it matches
+1. `POST /api/match` builds a query vector:
+   - **audio** — `source_moment_embedding()` mean-pools the source track's own
+     windows across the selected span, in the database
+   - **text** — CLAP's text tower embeds the user's description into the *same*
+     space, so a typed moment queries the catalog directly with no LLM in the
+     retrieval path
+   - both present → weighted blend (`AUDIO_QUERY_WEIGHT`)
+2. `match_moments()` runs HNSW cosine search over `moment_embeddings`,
+   over-fetching then `DISTINCT ON (spotify_id)` so one track can't flood results
+3. Below `MATCH_MIN_SIMILARITY`, results are dropped — an honest empty state
+   beats a fabricated near-miss
+4. Claude writes a one-line explanation per match, **given the measured features**
+   (timestamp, BPM, key, chord) and instructed not to invent what it can't see
+5. Each card shows track info, the real matched timestamp, and inline playback
+   seeked to that moment
 
 ---
 
@@ -223,17 +261,27 @@ Development mode allows up to 25 manually allowlisted users. This is sufficient 
 
 ---
 
-## AcousticBrainz Data
+## Catalog Strategy
 
-AcousticBrainz is discontinued but its full data dump (29.4M submissions) remains publicly downloadable. Splice uses a **curated subset**: ~500K tracks from the low-level CSV dump, covering widely-known recordings with reliable MBID links to MusicBrainz metadata.
+> ⚠️ **AcousticBrainz is retired as a data source. Do not reintroduce it.**
 
-The import pipeline (`services/analysis/import_acousticbrainz.py`) handles:
-1. Download the CSV dumps from acousticbrainz.org/download
-2. Filter to tracks with high-confidence features
-3. Normalize feature vectors
-4. Batch-insert into Supabase `track_features` with pgvector embeddings
+The project originally imported ~500K AcousticBrainz rows. Two fatal problems:
 
-This is a one-time setup step. See `services/analysis/README.md` for instructions.
+1. Its low-level data is **track-level aggregates only** — the import fabricated a
+   single full-track "segment". Moment matching against it is impossible by
+   construction.
+2. Its embedding layout was **structurally different** from the one our own
+   pipeline produces. The two were never comparable by cosine similarity, so
+   every AcousticBrainz-sourced result was noise dressed up with a percentage.
+
+The catalog is now built exclusively by `apps/web/scripts/seed-catalog.ts`, which
+runs a genre/era-diverse seed list through the *same* `/analyze` endpoint that
+serves live user searches. One embedding space, genuine per-window features,
+from the first row on.
+
+Coverage is bounded by preview availability, so the seed prefers **Apple Music
+previews via ISRC** (near-total catalog coverage) over Spotify's, which are now
+absent for most apps.
 
 ---
 
@@ -242,16 +290,24 @@ This is a one-time setup step. See `services/analysis/README.md` for instruction
 FastAPI microservice. Deployed on Railway (Docker).
 
 **Endpoints:**
-- `POST /analyze` — accepts a 30s audio URL, returns segment-level features
-- `POST /embed` — converts a feature dict to a 128-dim normalized vector
-- `GET /health` — health check
+- `POST /analyze` — audio URL → windowed CLAP embeddings + display metadata
+- `POST /analyze-upload` — same, from a multipart file (full-length tracks)
+- `POST /embed-text` — description → 512-dim vector in the shared audio/text space
+- `GET /health` — health check, reports `embedding_model` and load state
 
 **Key libraries:**
-- `librosa` — segment detection, spectral features, chroma, MFCCs
+- `laion-clap` — the moment embeddings (this is the search signal)
+- `torch` (CPU-only wheels) — CLAP inference
+- `librosa` — structural segmentation, chroma, MFCCs, beat tracking
 - `essentia` — tonal analysis, danceability, dynamic complexity
-- `numpy`, `scipy` — normalization, PCA
 - `fastapi`, `uvicorn` — API server
 - `httpx` — async audio file fetching
+
+> ⚠️ **Run ONE uvicorn worker.** The CLAP checkpoint is ~2GB resident and each
+> worker is a separate process with its own copy — the previous `--workers 16`
+> would have needed ~32GB of RAM. Concurrency comes from `ANALYSIS_CONCURRENCY`
+> (a semaphore over a threadpool) inside the single process, which is the right
+> shape anyway since analysis is CPU-bound.
 
 Authentication: shared secret header (`X-Service-Secret`). Not public-facing.
 
@@ -334,18 +390,29 @@ docker-compose up
   - `PORT=8000`
 - [ ] Copy the generated Railway URL → `ANALYSIS_SERVICE_URL` in web app env
 
-### 7. AcousticBrainz Data Import (one-time)
-- [ ] Download the low-level CSV dump from: https://acousticbrainz.org/download
-  - File: `acousticbrainz-lowlevel-features.csv.bz2` (~2GB compressed)
-- [ ] Run the import script (see `services/analysis/README.md`):
+### 7. Catalog Seed (one-time, run deliberately — it costs Railway compute)
+
+> Do NOT run this before the CLAP analysis service is deployed and `/health`
+> reports the expected `embedding_model`. Seeding against the wrong service
+> fills the catalog with vectors from a space nothing else can query.
+
+- [ ] Confirm the service is up: `curl $ANALYSIS_SERVICE_URL/health`
+- [ ] Dry run first — resolves candidates, writes nothing, calls no `/analyze`:
   ```bash
-  python import_acousticbrainz.py --input acousticbrainz-lowlevel-features.csv \
-    --supabase-url $NEXT_PUBLIC_SUPABASE_URL \
-    --supabase-key $SUPABASE_SERVICE_ROLE_KEY \
-    --limit 500000
+  pnpm --filter web seed:catalog -- --dry-run --limit 200
   ```
-- [ ] Import takes ~30-60 min. Monitor via the Supabase table editor.
-- [ ] After import, run: `SELECT count(*) FROM track_features;` — should be ~500K rows
+- [ ] Real run (start small, then widen):
+  ```bash
+  pnpm --filter web seed:catalog -- --limit 2000 --concurrency 4
+  ```
+- [ ] Verify one embedding space and real coverage:
+  ```sql
+  SELECT embedding_model, count(*) AS windows, count(DISTINCT spotify_id) AS tracks
+  FROM moment_embeddings GROUP BY 1;
+  ```
+- [ ] Only after results look sane, purge the legacy rows:
+  `DELETE FROM track_features WHERE source = 'acousticbrainz';`
+- [ ] Retune `MATCH_MIN_SIMILARITY` against the real score distribution
 
 ### 8. Vercel Deployment
 - [ ] Connect repo to Vercel at vercel.com
@@ -386,11 +453,23 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 - [x] pgvector similarity search → match results, incl. moment-window (not just full-track) embedding and Deep Cut mode
 - [x] Moment result cards with timestamp + explanation
 
+### Phase 1.5 — Search Rebuild (code complete, NOT yet validated against a deploy)
+- [x] CLAP (512-dim, joint audio/text) replaces the hand-built 128-dim embedding
+- [x] `moment_embeddings` — per-window vectors; a search hit is a real timestamp
+- [x] Removed the synthetic descriptor-derived query vector that made every
+      search run on a meaningless input
+- [x] Full-track upload path, so marks outside the 30s preview mean something
+- [x] Auth UI + moment saving (both previously unreachable)
+- [x] Inline result playback seeked to the matched moment
+- [ ] **Deploy the CLAP analysis service** — nothing below can be validated first
+- [ ] **Purge AcousticBrainz rows + re-seed** via `seed-catalog.ts` (the cutover)
+- [ ] **Retune `MATCH_MIN_SIMILARITY` and the `matchStrength()` bands** against a
+      real seeded catalog — current values are provisional guesses
+
 ### Phase 2 — Intelligence Layer
-- [ ] Saved moments library (per user) — `/library` page reads saved moments, but no UI action writes `is_saved: true` yet; nothing is actually savable today
+- [x] Saved moments library (per user)
 - [ ] Moment-based playlist export to Spotify
 - [ ] Match feedback (thumbs up/down) → descriptor refinement — `moment_feedback` table exists in schema, no API/UI wired up
-- [ ] Pre-indexed corpus searchable without on-demand analysis — was attempted via AcousticBrainz import, but that data is track-level-only and embeds in an incompatible space from on-demand analysis (see `services/analysis/README.md`); superseded by the bulk-seed script (`apps/web/scripts/seed-catalog.ts`), not yet run
 - [ ] Shareable moment cards (OG image generation)
 - [x] Apple Music integration (genre enrichment, ISRC resolution, preview-URL fallback, deep links) — not originally scoped, shipped alongside Phase 1
 
@@ -406,9 +485,12 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 | Decision | Rationale |
 |---|---|
 | No Spotify audio analysis | Deprecated Nov 2024, restricted to 250K MAU orgs May 2025 |
-| 30s preview only for analysis | Spotify preview URLs are public, no auth required |
-| AcousticBrainz for catalog | 29M pre-computed feature tracks, free, CC0, still downloadable |
+| Apple Music previews preferred | Spotify no longer returns `preview_url` for this app; Apple covers ~the whole catalog via ISRC |
+| CLAP over MERT | MERT has stronger music representations, but CLAP's **text tower** lets a typed description query the catalog directly — that removes the LLM from the retrieval path entirely |
+| Window-level, not track-level | Track-level averages make moment search impossible by construction and force fabricated timestamps |
+| 10s window / 5s hop | CLAP's encoder natively consumes ~10s; 50% overlap keeps boundary-straddling moments near a window centre |
+| User-supplied full tracks | The only legally clean route to full-length audio; bytes are analyzed in memory and never stored |
+| Catalog built by our own pipeline | Guarantees one embedding space — the failure mode that made AcousticBrainz useless |
 | Railway for analysis service | Docker-native, simple deploy, Python support, cheap for low traffic |
 | Inngest for job queue | Already familiar from Meridian, handles retry logic cleanly |
-| 128-dim embedding | Balance between matching precision and pgvector index performance |
 | No mobile app (Phase 1) | Web-first for portfolio demo; Expo possible in Phase 3 |
